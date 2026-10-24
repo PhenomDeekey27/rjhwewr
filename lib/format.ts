@@ -16,15 +16,23 @@ const NUMBER_1 = new Intl.NumberFormat("en-GB", {
   useGrouping: true,
 });
 
-const LONDON_DATE_TIME = new Intl.DateTimeFormat("en-GB", {
-  day: "numeric",
-  month: "short",
-  year: "numeric",
-  hour: "2-digit",
-  minute: "2-digit",
-  timeZone: "Europe/London",
-  timeZoneName: "short",
-});
+const zonedDateTimeFormatters = new Map<string, Intl.DateTimeFormat>();
+
+function zonedDateTimeFormatter(timeZone: string): Intl.DateTimeFormat {
+  const existing = zonedDateTimeFormatters.get(timeZone);
+  if (existing) return existing;
+  const formatter = new Intl.DateTimeFormat("en-GB", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone,
+    timeZoneName: "short",
+  });
+  zonedDateTimeFormatters.set(timeZone, formatter);
+  return formatter;
+}
 
 const LONDON_DAY = new Intl.DateTimeFormat("en-GB", {
   day: "numeric",
@@ -72,12 +80,36 @@ export function formatSignedMw(value: number | null | undefined): {
   return { sign, abs: NUMBER_0.format(Math.round(Math.abs(value))) };
 }
 
-/** "1 Jan 2026 00:00 GMT" with an explicit timezone label. */
-export function formatLondonTime(iso: string | null | undefined): string {
+/**
+ * "1 Jan 2026 00:00 GMT" with the explicit timezone label.
+ * UTC timestamps are only ever *displayed* in the requested zone.
+ */
+export function formatZonedTime(
+  iso: string | null | undefined,
+  timeZone: "Europe/London" | "UTC",
+): string {
   if (!iso) return PLACEHOLDER;
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return PLACEHOLDER;
-  return LONDON_DATE_TIME.format(date);
+  return zonedDateTimeFormatter(timeZone).format(date);
+}
+
+/** "1 Jan 2026 00:00 GMT" — delivery time in Europe/London. */
+export function formatLondonTime(iso: string | null | undefined): string {
+  return formatZonedTime(iso, "Europe/London");
+}
+
+/**
+ * Publication lead as whole minutes. Negative values mean the forecast was
+ * published after its delivery interval started; the sign is never hidden.
+ */
+export function formatLeadMinutes(minutes: number | null | undefined): string {
+  if (minutes === null || minutes === undefined || Number.isNaN(minutes)) {
+    return PLACEHOLDER;
+  }
+  const rounded = Math.round(minutes);
+  const sign = rounded < 0 ? "−" : "";
+  return `${sign}${NUMBER_0.format(Math.abs(rounded))} min`;
 }
 
 /** "1 Jan 2026" — delivery day only. */

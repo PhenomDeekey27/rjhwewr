@@ -35,24 +35,39 @@ from services.elexon_client import (
     chunk_date_windows,
     chunk_datetime_windows,
 )
+from services.elexon_client import clear_cache as clear_upstream_cache
+from services.explorer import (
+    build_explorer_rows,
+    filter_rows,
+    paginate,
+    sort_rows,
+)
 from services.fetch import DatasetFetch
+from services.forecast_accuracy import build_accuracy_result
 from services.fuelhh import FUELHH, FUELHH_PATH, fetch_fuelhh
 from services.models import (
     FUELHH_DOCS_URL,
     WINDFOR_DOCS_URL,
+    AccuracyEnvelope,
+    AlignmentInfo,
     DatasetQuality,
     DatasetResolutions,
     DatasetSummary,
     Envelope,
+    ForecastSelection,
     FuelHhRecord,
+    IntervalRecord,
     Meta,
     ObservedCoverage,
     Pagination,
+    PreparedInfo,
     Quality,
     QualityCheck,
+    RecordPage,
     Window,
     WindForRecord,
 )
+from services.prepared import get_prepared, with_prepared_meta
 from services.resolution import detect_resolution
 from services.windfor import WINDFOR, WINDFOR_PATH, fetch_windfor
 
@@ -316,13 +331,16 @@ def _build_quality(fetches: list[DatasetFetch], *, notes: list[str]) -> Quality:
 
 
 COMMON_NOTES = [
-    "Raw Elexon records only: no forecast selection, no alignment and no "
-    "accuracy metrics (MAE, RMSE, bias, coverage) are computed at this stage.",
     "Timestamp resolution is observed from the retrieved records, never "
     "assumed; source timestamps and raw values are preserved unchanged.",
     "Null generation values are preserved as null and never coerced to zero.",
     "No credentials are used: the Elexon Insights API is public and requires "
     "no API key.",
+]
+
+RAW_ONLY_NOTES = COMMON_NOTES + [
+    "Raw records only: this response applies no day-ahead forecast selection "
+    "and computes no accuracy metrics. Every publication version is returned.",
 ]
 
 QUALITY_NOTES = [
@@ -359,7 +377,7 @@ def build_windfor_response(
         retrieved_at=_now(now),
         publication_window=publication_window,
         settlement_window=None,
-        notes=COMMON_NOTES
+        notes=RAW_ONLY_NOTES
         + [
             "WINDFOR is queried by publish time only; the publication window "
             "extends before 1 January 2026 so forecasts published in late "
@@ -394,7 +412,7 @@ def build_fuelhh_response(
         retrieved_at=_now(now),
         publication_window=None,
         settlement_window=settlement_window,
-        notes=COMMON_NOTES
+        notes=RAW_ONLY_NOTES
         + [
             "FUELHH is queried with settlementDateFrom/settlementDateTo and "
             "the server-side fuelType=WIND filter; fuelType is re-checked "
@@ -491,14 +509,332 @@ def build_summary_response(
     )
 
 
+# --- combined envelope helpers -------------------------------------------- #
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            ordered.append(value)
+    return ordered
+
+
+def _first_non_none(items: list, attribute: str):
+    for item in items:
+        value = getattr(item, attribute)
+        if value is not None:
+            return value
+    return None
+
+
+def _combined_meta(
+    envelopes: list[Envelope],
+    *,
+    prepared: PreparedInfo | None = None,
+    record_page: RecordPage | None = None,
+    selection: ForecastSelection | None = None,
+    alignment: AlignmentInfo | None = None,
+    unit: str | None = None,
+    extra_notes: list[str] | None = None,
+) -> Meta:
+    """One metadata block for responses that draw on both raw datasets.
+
+    Resolution, coverage, record counts and documentation are copied from the
+    real per-dataset metadata, never re-derived or guessed in the route.
+    """
+    metas = [envelope.meta for envelope in envelopes]
+    resolutions: dict[str, DatasetResolutions] = {}
+    coverage: dict[str, ObservedCoverage] = {}
+    counts: dict[str, int] = {}
+    documents: dict[str, str] = {}
+    request_windows = []
+    paginations = []
+    for meta in metas:
+        resolutions.update(meta.observed_resolutions)
+        coverage.update(meta.observed_coverage)
+        counts.update(meta.record_counts)
+        documents.update(meta.documentation)
+        request_windows.extend(meta.request_windows)
+        if meta.pagination is not None:
+            paginations.append(meta.pagination)
+
+    retrieved = [meta.retrieved_at for meta in metas if meta.retrieved_at is not None]
+
+    return Meta(
+        datasets=_dedupe([name for meta in metas for name in meta.datasets]),
+        retrieved_at=max(retrieved) if retrieved else None,
+        delivery_window=_first_non_none(metas, "delivery_window"),
+        publication_window=_first_non_none(metas, "publication_window"),
+        settlement_window=_first_non_none(metas, "settlement_window"),
+        request_windows=request_windows,
+        pagination=Pagination(
+            strategy=STRATEGY,
+            max_window_days=MAX_WINDOW_DAYS,
+            windows_requested=sum(p.windows_requested for p in paginations),
+            windows_succeeded=sum(p.windows_succeeded for p in paginations),
+            empty_windows=sum(p.empty_windows for p in paginations),
+        ),
+        observed_resolutions=resolutions,
+        observed_coverage=coverage,
+        record_counts=counts,
+        record_count=sum(counts.values()),
+        record_page=record_page,
+        prepared=prepared,
+        selection=selection,
+        alignment=alignment,
+        unit=unit,
+        documentation=documents,
+        notes=_dedupe(
+            [note for meta in metas for note in meta.notes]
+            + list(extra_notes or [])
+        ),
+    )
+
+
+def _combined_quality(
+    envelopes: list[Envelope],
+    *,
+    extra_checks: list[QualityCheck] | None = None,
+    extra_notes: list[str] | None = None,
+) -> Quality:
+    """Combine per-dataset quality counts, checks and notes."""
+    per_dataset: dict[str, DatasetQuality] = {}
+    reasons: dict[str, int] = {}
+    checks: list[QualityCheck] = []
+    for envelope in envelopes:
+        per_dataset.update(envelope.quality.per_dataset)
+        for reason, count in envelope.quality.rejected_reasons.items():
+            reasons[reason] = reasons.get(reason, 0) + count
+        checks.extend(envelope.quality.checks)
+    checks.extend(extra_checks or [])
+
+    return Quality(
+        rows_fetched=sum(e.quality.rows_fetched for e in envelopes),
+        accepted=sum(e.quality.accepted for e in envelopes),
+        rejected=sum(e.quality.rejected for e in envelopes),
+        rejected_reasons={k: v for k, v in reasons.items() if v},
+        duplicates_removed=sum(
+            e.quality.duplicates_removed for e in envelopes
+        ),
+        null_generation=sum(e.quality.null_generation for e in envelopes),
+        null_publish_time=sum(
+            e.quality.null_publish_time for e in envelopes
+        ),
+        per_dataset=per_dataset,
+        checks=checks,
+        notes=_dedupe(
+            [note for e in envelopes for note in e.quality.notes]
+            + list(extra_notes or [])
+        ),
+    )
+
+
+# --- prepared (cached) dataset access ------------------------------------- #
+
+
+def prepared_windfor(
+    client: ElexonClient, *, refresh: bool = False
+):
+    """Validated WINDFOR envelope from the prepared cache.
+
+    ``refresh`` clears the lower-level upstream HTTP cache before rebuilding so
+    a refresh is a real upstream request, not a replay of cached responses.
+    """
+    if refresh:
+        clear_upstream_cache()
+    return get_prepared(
+        f"dataset:{WINDFOR}",
+        lambda: build_windfor_response(client),
+        refresh=refresh,
+    )
+
+
+def prepared_fuelhh(
+    client: ElexonClient, *, refresh: bool = False
+):
+    """Validated FUELHH envelope from the prepared cache."""
+    if refresh:
+        clear_upstream_cache()
+    return get_prepared(
+        f"dataset:{FUELHH}",
+        lambda: build_fuelhh_response(client),
+        refresh=refresh,
+    )
+
+
+def build_prepared_windfor_response(
+    client: ElexonClient, *, refresh: bool = False
+) -> Envelope[WindForRecord]:
+    result = prepared_windfor(client, refresh=refresh)
+    envelope = result.value
+    return envelope.model_copy(
+        update={"meta": with_prepared_meta(envelope.meta, result)}
+    )
+
+
+def build_prepared_fuelhh_response(
+    client: ElexonClient, *, refresh: bool = False
+) -> Envelope[FuelHhRecord]:
+    result = prepared_fuelhh(client, refresh=refresh)
+    envelope = result.value
+    return envelope.model_copy(
+        update={"meta": with_prepared_meta(envelope.meta, result)}
+    )
+
+
+# --- Data Explorer (server-paginated raw records) -------------------------- #
+
+
+def build_explorer_response(
+    client: ElexonClient,
+    *,
+    page: int,
+    per_page: int,
+    sort: str,
+    direction: str,
+    status: str | None = None,
+    matched_only: bool = False,
+    refresh: bool = False,
+) -> Envelope[IntervalRecord]:
+    """Return one page of raw interval records.
+
+    Only ``per_page`` rows are serialised. The row list is prepared once per
+    dataset generation and then filtered, sorted and sliced, so page navigation
+    does not refetch, re-validate or re-render the full dataset.
+    """
+    wind = prepared_windfor(client, refresh=refresh)
+    fuel = prepared_fuelhh(client, refresh=refresh)
+    rows = get_prepared(
+        (
+            "explorer:"
+            f"{wind.prepared_at.isoformat()}:"
+            f"{fuel.prepared_at.isoformat()}"
+        ),
+        lambda: build_explorer_rows(wind.value.data, fuel.value.data),
+        refresh=refresh,
+    )
+
+    filters: dict[str, str] = {}
+    if status:
+        filters["status"] = status
+    if matched_only:
+        filters["matchedOnly"] = "true"
+
+    filtered = filter_rows(
+        rows.value, status=status, matched_only=matched_only
+    )
+    ordered = sort_rows(filtered, sort=sort, direction=direction)
+    page_rows, record_page = paginate(
+        ordered,
+        page=page,
+        per_page=per_page,
+        sort=sort,
+        direction=direction,
+        filters=filters,
+    )
+
+    return Envelope[IntervalRecord](
+        data=page_rows,
+        meta=_combined_meta(
+            [wind.value, fuel.value],
+            prepared=rows.info(),
+            record_page=record_page,
+        ),
+        quality=_combined_quality([wind.value, fuel.value]),
+    )
+
+
+# --- forecast accuracy ---------------------------------------------------- #
+
+
+def build_accuracy_response(
+    client: ElexonClient, *, refresh: bool = False
+) -> AccuracyEnvelope:
+    """Select, align and score day-ahead forecasts for January 2026."""
+    wind = prepared_windfor(client, refresh=refresh)
+    fuel = prepared_fuelhh(client, refresh=refresh)
+
+    wind_delivery = wind.value.meta.observed_resolutions.get(WINDFOR)
+    fuel_delivery = fuel.value.meta.observed_resolutions.get(FUELHH)
+
+    result = get_prepared(
+        (
+            "accuracy:"
+            f"{wind.prepared_at.isoformat()}:"
+            f"{fuel.prepared_at.isoformat()}"
+        ),
+        lambda: build_accuracy_result(
+            forecasts=wind.value.data,
+            fuelhh=fuel.value.data,
+            delivery_start=DELIVERY_START,
+            delivery_end_exclusive=DELIVERY_END_EXCLUSIVE,
+            forecast_resolution_minutes=(
+                wind_delivery.delivery.minutes
+                if wind_delivery is not None
+                else None
+            ),
+            actual_resolution_minutes=(
+                fuel_delivery.delivery.minutes
+                if fuel_delivery is not None
+                else None
+            ),
+        ),
+        refresh=refresh,
+    )
+    accuracy = result.value
+
+    notes = [
+        "Forecast selection uses the proposed D-1 09:00 Europe/London cutoff; "
+        "the cutoff is an unconfirmed assumption and changing it changes every "
+        "metric.",
+        "Metrics use matched intervals only. Unmatched intervals are counted "
+        "by reason in data.missing and are never treated as zero error.",
+        "The expected interval count is computed from the January 2026 "
+        "delivery window at the detected forecast resolution.",
+        "Alignment is explicit: see meta.alignment. No forecast value is "
+        "interpolated or duplicated into finer slots.",
+        "Generation units are MW for both datasets; FUELHH values are average "
+        "MW over each 30-minute settlement period.",
+    ]
+
+    return AccuracyEnvelope(
+        data=accuracy.payload,
+        meta=_combined_meta(
+            [wind.value, fuel.value],
+            prepared=result.info(),
+            selection=accuracy.selection,
+            alignment=accuracy.alignment,
+            unit=accuracy.unit,
+            extra_notes=notes,
+        ),
+        quality=_combined_quality(
+            [wind.value, fuel.value],
+            extra_checks=accuracy.checks,
+            extra_notes=[
+                "Accuracy checks run on the selected and aligned intervals "
+                "before any metric is presented."
+            ],
+        ),
+    )
+
+
 __all__ = [
     "DELIVERY_END_EXCLUSIVE",
     "DELIVERY_START",
     "FUELHH",
     "WINDFOR",
+    "build_accuracy_response",
+    "build_explorer_response",
     "build_fuelhh_response",
+    "build_prepared_fuelhh_response",
+    "build_prepared_windfor_response",
     "build_summary_response",
     "build_windfor_response",
+    "prepared_fuelhh",
+    "prepared_windfor",
     "publish_windows",
     "settlement_windows",
 ]

@@ -40,9 +40,9 @@ FUELHH_DOCS_URL = (
 CUTOFF_STATUS = "unconfirmed"
 CUTOFF_RULE = "D-1 09:00 Europe/London"
 CUTOFF_NOTE = (
-    "Proposed day-ahead decision cutoff only. Stage 3 performs no forecast "
-    "selection and computes no accuracy metrics (MAE, RMSE, bias, coverage); "
-    "those belong to Stage 4. The cutoff must be confirmed before it is used."
+    "Proposed day-ahead decision cutoff. Forecast selection uses it, but it "
+    "remains an unconfirmed business assumption: a different gate changes "
+    "which forecast is selected and therefore every accuracy metric."
 )
 
 
@@ -162,6 +162,60 @@ class CutoffNote(ApiModel):
     note: str = CUTOFF_NOTE
 
 
+class RecordPage(ApiModel):
+    """Server-side page metadata for record-level endpoints.
+
+    This is deliberately separate from :class:`Pagination`, which describes the
+    upstream Elexon request windows. ``total_records`` is the number of rows in
+    the prepared result *after* filters and *before* slicing, so the UI can
+    compute an honest page count without downloading the full dataset.
+    """
+
+    page: int = 1
+    per_page: int = 0
+    total_records: int = 0
+    total_pages: int = 0
+    returned: int = 0
+    sort: str | None = None
+    direction: str | None = None
+    filters: dict[str, str] = {}
+
+
+class PreparedInfo(ApiModel):
+    """How a response relates to the prepared (server-side) cache."""
+
+    cached: bool = False
+    prepared_at: datetime | None = None
+    age_seconds: float | None = None
+    ttl_seconds: int | None = None
+
+
+class ForecastSelection(ApiModel):
+    """The forecast-selection rule actually applied to the payload."""
+
+    rule: str = CUTOFF_RULE
+    cutoff_local_time: str = "09:00"
+    cutoff_timezone: str = "Europe/London"
+    status: str = CUTOFF_STATUS
+    policy: str = (
+        "latest publishTime at or before the cutoff, per delivery interval"
+    )
+    selected_records: int = 0
+    unmatched_intervals: int = 0
+
+
+class AlignmentInfo(ApiModel):
+    """The resolution-alignment method actually applied to the payload."""
+
+    method: str
+    description: str
+    forecast_resolution_minutes: int | None = None
+    actual_resolution_minutes: int | None = None
+    actuals_per_forecast_interval: int | None = None
+    affected_intervals: int = 0
+    interpolation: str = "none"
+
+
 class ErrorDetail(ApiModel):
     type: str
     message: str
@@ -186,6 +240,11 @@ class Meta(ApiModel):
     observed_coverage: dict[str, ObservedCoverage] = {}
     record_counts: dict[str, int] = {}
     record_count: int = 0
+    record_page: RecordPage | None = None
+    prepared: PreparedInfo | None = None
+    selection: ForecastSelection | None = None
+    alignment: AlignmentInfo | None = None
+    unit: str | None = None
     day_ahead_cutoff: CutoffNote = Field(default_factory=CutoffNote)
     documentation: dict[str, str] = {}
     error: ErrorDetail | None = None
@@ -239,6 +298,106 @@ class DatasetSummary(ApiModel):
     requested_settlement_window: Window | None = None
 
 
+# --------------------------------------------------------------------------- #
+# Data Explorer (record-level, server-paginated)
+# --------------------------------------------------------------------------- #
+
+#: Forecast and actual both present. No day-ahead selection is applied here.
+STATUS_SOURCE_ONLY = "Source data only"
+STATUS_NO_ACTUAL = "No actual"
+STATUS_NO_FORECAST = "No eligible forecast"
+
+
+class IntervalRecord(ApiModel):
+    """One raw explorer row.
+
+    A row is one WINDFOR publication version joined on ``startTime`` to the
+    FUELHH outturn for the same delivery interval, or a FUELHH record that has
+    no WINDFOR row at that ``startTime``. All raw forecasts are preserved:
+    rows are never collapsed to a single forecast per interval.
+    """
+
+    delivery_time: datetime
+    forecast_published: datetime | None = None
+    publication_lead_minutes: int | None = None
+    forecast_generation: int | None = None
+    actual_generation: int | None = None
+    error: int | None = None
+    match_status: str
+    settlement_date: date | None = None
+    settlement_period: int | None = None
+
+
+# --------------------------------------------------------------------------- #
+# Forecast accuracy (selection + alignment + metrics)
+# --------------------------------------------------------------------------- #
+
+STATUS_MATCHED = "matched"
+STATUS_NO_ELIGIBLE_FORECAST = "noEligibleForecast"
+STATUS_MISSING_ACTUAL = "missingActual"
+STATUS_NULL_FORECAST_VALUE = "nullForecastValue"
+STATUS_NULL_ACTUAL_VALUE = "nullActualValue"
+STATUS_ALIGNMENT_UNAVAILABLE = "alignmentUnavailable"
+
+
+class AccuracySummary(ApiModel):
+    """Whole-period metrics over matched hourly forecast intervals only."""
+
+    unit: str = "MW"
+    mae: float | None = None
+    rmse: float | None = None
+    bias: float | None = None
+    matched_intervals: int = 0
+    expected_intervals: int = 0
+    coverage_percent: float | None = None
+    matched_actual_half_hours: int = 0
+    expected_actual_half_hours: int = 0
+
+
+class DailyAccuracy(ApiModel):
+    """Metrics for one Europe/London delivery day."""
+
+    delivery_date: date
+    expected_intervals: int = 0
+    matched_intervals: int = 0
+    coverage_percent: float | None = None
+    mae: float | None = None
+    rmse: float | None = None
+    bias: float | None = None
+    missing_by_reason: dict[str, int] = {}
+
+
+class IntervalAccuracy(ApiModel):
+    """One delivery interval at the forecast's native resolution."""
+
+    delivery_time: datetime
+    delivery_date: date
+    forecast_published: datetime | None = None
+    forecast_generation: int | None = None
+    actual_generation: float | None = None
+    error: float | None = None
+    status: str
+    actual_observations: int = 0
+
+
+class MissingInterval(ApiModel):
+    delivery_time: datetime
+    delivery_date: date
+    reason: str
+
+
+class MissingData(ApiModel):
+    by_reason: dict[str, int] = {}
+    intervals: list[MissingInterval] = []
+
+
+class AccuracyPayload(ApiModel):
+    summary: AccuracySummary
+    daily: list[DailyAccuracy] = []
+    intervals: list[IntervalAccuracy] = []
+    missing: MissingData = Field(default_factory=MissingData)
+
+
 T = TypeVar("T")
 
 
@@ -246,5 +405,13 @@ class Envelope(ApiModel, Generic[T]):
     """Consistent response structure: data + meta + quality."""
 
     data: list[T]
+    meta: Meta
+    quality: Quality
+
+
+class AccuracyEnvelope(ApiModel):
+    """Accuracy response: ``data`` is one computed payload, not a row list."""
+
+    data: AccuracyPayload
     meta: Meta
     quality: Quality

@@ -1,10 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { TopBar } from "@/components/layout/TopBar";
 import { PageContainer } from "@/components/layout/PageContainer";
 import { FilterBar } from "@/components/ui/FilterBar";
 import {
+  Button,
   Field,
   SegmentedControl,
   Select,
@@ -14,30 +15,29 @@ import {
   DataExplorerTable,
   type DataExplorerRow,
   type MatchStatus,
+  type SortKey,
 } from "@/components/dashboard/DataExplorerTable";
-import { Button } from "@/components/ui/controls";
 import { IconDownload, IconRetry } from "@/components/ui/icons";
 import {
-  fetchFuelHh,
-  fetchWindFor,
+  fetchExplorerRecords,
   clearCache,
   type Envelope,
-  type FuelHhRecord,
-  type WindForRecord,
+  type ExplorerRecord,
 } from "@/lib/api";
-import { formatLondonTime } from "@/lib/format";
-import { DataQualityPanel, emptyQualityItems } from "@/components/dashboard/DataQualityPanel";
+import {
+  PLACEHOLDER,
+  formatCount,
+  formatLeadMinutes,
+  formatZonedTime,
+} from "@/lib/format";
+import {
+  DataQualityPanel,
+  emptyQualityItems,
+} from "@/components/dashboard/DataQualityPanel";
 import { StateBlock } from "@/components/ui/StateBlock";
 
 type TimeZone = "Europe/London" | "UTC";
 type StatusFilter = "all" | MatchStatus;
-
-type PaginationMeta = {
-  page: number;
-  perPage: number;
-  totalRecords: number;
-  totalPages: number;
-};
 
 function SummaryChip({ children }: { children: React.ReactNode }) {
   return (
@@ -47,220 +47,265 @@ function SummaryChip({ children }: { children: React.ReactNode }) {
   );
 }
 
+function RetryButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="h-9 rounded-sm border border-border-default bg-surface px-3 text-[11px] font-medium text-text-primary hover:bg-surface-subtle"
+    >
+      Retry
+    </button>
+  );
+}
+
+function toDisplayRow(
+  record: ExplorerRecord,
+  timeZone: TimeZone,
+): DataExplorerRow {
+  return {
+    deliveryTime: formatZonedTime(record.deliveryTime, timeZone),
+    forecastPublished: record.forecastPublished
+      ? formatZonedTime(record.forecastPublished, timeZone)
+      : PLACEHOLDER,
+    publicationLead: formatLeadMinutes(record.publicationLeadMinutes),
+    forecastMw: record.forecastGeneration,
+    actualMw: record.actualGeneration,
+    errorMw: record.error,
+    matchStatus: record.matchStatus as MatchStatus,
+    settlement:
+      record.settlementDate && record.settlementPeriod
+        ? `${record.settlementDate} · P${record.settlementPeriod}`
+        : undefined,
+  };
+}
+
 export default function DataExplorerPage() {
   const [timeZone, setTimeZone] = useState<TimeZone>("Europe/London");
-  const [loadStatus, setLoadStatus] = useState<"loading" | "success" | "error">("loading");
-  const [rows, setRows] = useState<DataExplorerRow[]>([]);
-  const [windforData, setWindforData] = useState<Envelope<WindForRecord> | null>(null);
-  const [fuelhhData, setFuelhhData] = useState<Envelope<FuelHhRecord> | null>(null);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [isRefreshing, setIsRefreshing] = useState(false);
-  const [pagination, setPagination] = useState<PaginationMeta>({
-    page: 1,
-    perPage: 50,
-    totalRecords: 0,
-    totalPages: 1,
-  });
-
-  // Track if a refresh is already in progress to prevent duplicate concurrent refreshes
-  const refreshInProgressRef = useRef(false);
-  // Abort controller to cancel obsolete requests
-  const abortControllerRef = useRef<AbortController | null>(null);
-
-  const buildRows = useCallback(
-    (fuelResult: Envelope<FuelHhRecord>, windResult: Envelope<WindForRecord>): DataExplorerRow[] => {
-      // Build a map of FUELHH actuals by delivery time (startTime)
-      const actualsByDelivery = new Map<string, FuelHhRecord>();
-      for (const record of fuelResult.data) {
-        actualsByDelivery.set(record.startTime, record);
-      }
-
-      // Create rows: one per WINDFOR forecast, matched with actual if available
-      const mergedRows: DataExplorerRow[] = [];
-      for (const forecast of windResult.data) {
-        const actual = actualsByDelivery.get(forecast.startTime);
-        mergedRows.push({
-          deliveryTime: formatLondonTime(forecast.startTime),
-          forecastPublished: forecast.publishTime
-            ? formatLondonTime(forecast.publishTime)
-            : "—",
-          publicationLead: forecast.publishTime
-            ? `${Math.round(
-                (new Date(forecast.startTime).getTime() -
-                  new Date(forecast.publishTime).getTime()) /
-                  60000,
-              )} min`
-            : "—",
-          forecastMw: forecast.generation,
-          actualMw: actual?.generation ?? null,
-          errorMw:
-            forecast.generation !== null &&
-            actual !== undefined &&
-            actual.generation !== null
-              ? forecast.generation - actual.generation
-              : null,
-          matchStatus:
-            actual !== undefined ? ("Source data only" as MatchStatus) : ("No actual" as MatchStatus),
-          settlement: actual?.settlementDate && actual?.settlementPeriod
-            ? `${actual.settlementDate} · P${actual.settlementPeriod}`
-            : undefined,
-        });
-      }
-
-      // Also add FUELHH actuals that have no matching forecast
-      for (const actual of fuelResult.data) {
-        const hasForecast = windResult.data.some(
-          (f) => f.startTime === actual.startTime,
-        );
-        if (!hasForecast) {
-          mergedRows.push({
-            deliveryTime: formatLondonTime(actual.startTime),
-            forecastPublished: "—",
-            publicationLead: "—",
-            forecastMw: null,
-            actualMw: actual.generation,
-            errorMw: null,
-            matchStatus: "No eligible forecast" as MatchStatus,
-            settlement:
-              actual.settlementDate && actual.settlementPeriod
-                ? `${actual.settlementDate} · P${actual.settlementPeriod}`
-                : undefined,
-          });
-        }
-      }
-
-      // Sort by delivery time
-      mergedRows.sort((a, b) =>
-        a.deliveryTime.localeCompare(b.deliveryTime),
-      );
-
-      return mergedRows;
-    },
-    [],
-  );
-
-  const loadData = useCallback(async (isRefresh = false) => {
-    // Prevent duplicate concurrent refreshes
-    if (refreshInProgressRef.current) {
-      return;
-    }
-    refreshInProgressRef.current = true;
-
-    // Cancel any in-flight request
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-    }
-    abortControllerRef.current = new AbortController();
-    const signal = abortControllerRef.current.signal;
-
-    if (isRefresh) {
-      setIsRefreshing(true);
-    } else {
-      setLoadStatus("loading");
-    }
-
-    try {
-      const [fuelResult, windResult] = await Promise.all([
-        fetchFuelHh({
-          page: pagination.page,
-          perPage: pagination.perPage,
-        }),
-        fetchWindFor({
-          page: pagination.page,
-          perPage: pagination.perPage,
-        }),
-      ]);
-
-      // Check if request was aborted
-      if (signal.aborted) {
-        return;
-      }
-
-      setFuelhhData(fuelResult);
-      setWindforData(windResult);
-
-      const mergedRows = buildRows(fuelResult, windResult);
-      setRows(mergedRows);
-      setLoadStatus("success");
-      setErrorMessage(null);
-
-      // Update pagination metadata from response
-      if (
-        fuelResult.meta &&
-        "pagination" in fuelResult.meta &&
-        typeof (fuelResult.meta as any).pagination !== "undefined"
-      ) {
-        setPagination({
-          page: pagination.page,
-          perPage: pagination.perPage,
-          totalRecords:
-            (fuelResult.meta as any).pagination.total_records ?? 0,
-          totalPages: Math.ceil(
-            (fuelResult.meta as any).pagination.total_records ?? 0
-              / pagination.perPage,
-          ),
-        });
-      }
-    } catch (error) {
-      // Ignore aborted requests
-      if (error instanceof Error && error.name === "AbortError") {
-        return;
-      }
-      if (!isRefresh) {
-        setRows([]);
-        setFuelhhData(null);
-        setWindforData(null);
-      }
-      setLoadStatus("error");
-      setErrorMessage(
-        error instanceof Error ? error.message : "Backend unavailable",
-      );
-    } finally {
-      if (!signal.aborted) {
-        setIsRefreshing(false);
-        refreshInProgressRef.current = false;
-      }
-    }
-  }, [buildRows, pagination]);
-
-  const handleRefresh = useCallback(() => {
-    clearCache("/api/elexon/windfor");
-    clearCache("/api/elexon/fuelhh");
-    // Reset to page 1 on refresh
-    setPagination({ page: 1, perPage: 50, totalRecords: 0, totalPages: 1 });
-    loadData(true);
-  }, [loadData]);
-
-  useEffect(() => {
-    (async () => {
-      await loadData(false);
-    })();
-    // Cleanup on unmount
-    return () => {
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-      }
-    };
-  }, [loadData]);
   const [status, setStatus] = useState<StatusFilter>("all");
   const [matchedOnly, setMatchedOnly] = useState(false);
+  const [page, setPage] = useState(1);
+  const [perPage, setPerPage] = useState<number>(50);
+  const [sortKey, setSortKey] = useState<SortKey>("deliveryTime");
+  const [sortDirection, setSortDirection] = useState<"asc" | "desc">("asc");
+
+  const [envelope, setEnvelope] = useState<Envelope<ExplorerRecord> | null>(
+    null,
+  );
+
+  // Loading is derived from which query the latest success/error belongs to.
+  // That keeps the effect free of synchronous setState calls (which cause an
+  // extra render pass on every page/filter change).
+  const request = useMemo(
+    () => ({
+      page,
+      perPage,
+      sort: sortKey,
+      direction: sortDirection,
+      status: status === "all" ? undefined : status,
+      matchedOnly: matchedOnly ? true : undefined,
+    }),
+    [page, perPage, sortKey, sortDirection, status, matchedOnly],
+  );
+  const queryKey = JSON.stringify(request);
+  const [loadedKey, setLoadedKey] = useState<string | null>(null);
+  const [errorKey, setErrorKey] = useState<string | null>(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [lastSuccessAt, setLastSuccessAt] = useState<string | null>(null);
+  const [refreshNonce, setRefreshNonce] = useState(0);
+  const refreshPendingRef = useRef(false);
+
+  const loadState: "loading" | "success" | "error" =
+    errorKey === queryKey
+      ? "error"
+      : loadedKey === queryKey
+        ? "success"
+        : "loading";
+  const busy = isRefreshing || loadState === "loading";
+
+  useEffect(() => {
+    const refresh = refreshPendingRef.current;
+    refreshPendingRef.current = false;
+    const controller = new AbortController();
+    let cancelled = false;
+    const requestKey = queryKey;
+
+    (async () => {
+      try {
+        const response = await fetchExplorerRecords(request, {
+          refresh,
+          signal: controller.signal,
+        });
+        if (cancelled) return;
+
+        const recordPage = response.meta.recordPage;
+        const maxPage = Math.max(1, recordPage?.totalPages ?? 1);
+        if (recordPage && request.page > maxPage) {
+          // A filter or refresh shrank the result set; return to a real page
+          // instead of showing an empty page with stale numbering.
+          setPage(maxPage);
+          return;
+        }
+
+        setEnvelope(response);
+        setLoadedKey(requestKey);
+        setErrorKey(null);
+        setErrorMessage(null);
+        setLastSuccessAt(
+          response.meta.retrievedAt ?? new Date().toISOString(),
+        );
+      } catch (error) {
+        if (cancelled) return;
+        if (error instanceof Error && error.name === "AbortError") return;
+        // Keep the last successful page visible; the banner and the status chip
+        // mark it as errored/stale rather than pretending it is loaded.
+        setErrorKey(requestKey);
+        setErrorMessage(
+          error instanceof Error ? error.message : "Backend unavailable",
+        );
+      } finally {
+        if (!cancelled) setIsRefreshing(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [request, queryKey, refreshNonce]);
+
+  const rows = useMemo(() => {
+    if (!envelope) return [];
+    return envelope.data.map((record) => toDisplayRow(record, timeZone));
+  }, [envelope, timeZone]);
+
+  const recordPage = envelope?.meta.recordPage ?? null;
+  const pagination = {
+    page: recordPage?.page ?? page,
+    perPage: recordPage?.perPage ?? perPage,
+    totalRecords: recordPage?.totalRecords ?? 0,
+    totalPages: Math.max(1, recordPage?.totalPages ?? 1),
+  };
 
   const filtersActive =
     timeZone !== "Europe/London" || status !== "all" || matchedOnly;
-  const statusLabel = status === "all" ? "All statuses" : status;
+
+  const handleRefresh = () => {
+    clearCache("/api/elexon/explorer");
+    refreshPendingRef.current = true;
+    setIsRefreshing(true);
+    setErrorKey(null);
+    setErrorMessage(null);
+    if (page !== 1) {
+      setPage(1);
+    } else {
+      setRefreshNonce((value) => value + 1);
+    }
+  };
+
+  const resetFilters = () => {
+    setTimeZone("Europe/London");
+    setStatus("all");
+    setMatchedOnly(false);
+    setPage(1);
+  };
+
+  const checksPassed =
+    envelope !== null &&
+    envelope.quality.checks.length > 0 &&
+    envelope.quality.checks.every((check) => check.passed);
+
+  const dataStatus =
+    busy
+      ? {
+          label: isRefreshing ? "Refreshing" : "Loading",
+          variant: "neutral" as const,
+        }
+      : loadState === "error"
+        ? { label: "Error", variant: "error" as const }
+        : checksPassed
+          ? {
+              label: lastSuccessAt
+                ? `Loaded · ${formatZonedTime(lastSuccessAt, timeZone)}`
+                : "Loaded",
+              variant: "favorable" as const,
+            }
+          : { label: "Partial data", variant: "warning" as const };
+
+  const windforLabel =
+    envelope?.meta.observedResolutions.WINDFOR?.delivery.label ??
+    "Not available";
+  const fuelhhLabel =
+    envelope?.meta.observedResolutions.FUELHH?.delivery.label ??
+    "Not available";
+  const prepared = envelope?.meta.prepared ?? null;
+
+  const qualityItems =
+    envelope !== null
+      ? [
+          {
+            label: "Forecast records retrieved (WINDFOR)",
+            value: formatCount(
+              envelope.meta.recordCounts.WINDFOR ?? envelope.quality.accepted,
+            ),
+          },
+          {
+            label: "Actual records retrieved (FUELHH)",
+            value: formatCount(
+              envelope.meta.recordCounts.FUELHH ?? envelope.quality.accepted,
+            ),
+          },
+          {
+            label: "Interval rows (filtered)",
+            value: formatCount(recordPage?.totalRecords ?? rows.length),
+            note: recordPage
+              ? `page ${recordPage.page} of ${Math.max(1, recordPage.totalPages)} · ${formatCount(recordPage.returned)} on this page`
+              : undefined,
+          },
+          {
+            label: "Null or invalid values",
+            value: formatCount(
+              envelope.quality.nullGeneration + envelope.quality.rejected,
+            ),
+            note: `${formatCount(envelope.quality.duplicatesRemoved)} duplicate(s) removed`,
+          },
+          {
+            label: "Time resolution — WINDFOR",
+            value: windforLabel,
+            note: "Detected from data",
+          },
+          {
+            label: "Time resolution — FUELHH",
+            value: fuelhhLabel,
+            note: "Detected from data",
+          },
+          {
+            label: "Data freshness",
+            value: formatZonedTime(envelope.meta.retrievedAt, timeZone),
+          },
+          {
+            label: "Prepared cache",
+            value: prepared
+              ? prepared.cached
+                ? `Cached · ${formatCount(prepared.ageSeconds ?? 0)}s old`
+                : "Rebuilt from Elexon"
+              : "Not available",
+            note: prepared?.ttlSeconds
+              ? `TTL ${formatCount(prepared.ttlSeconds)}s`
+              : undefined,
+          },
+          {
+            label: "Validation checks",
+            value: checksPassed ? "All passed" : "See details",
+            note: `${envelope.quality.checks.filter((check) => check.passed).length}/${envelope.quality.checks.length} passed`,
+          },
+        ]
+      : emptyQualityItems();
 
   return (
     <>
-      <TopBar
-        title="Data Explorer"
-        dataStatus={
-          loadStatus === "loading"
-            ? { label: "Loading", variant: "neutral" }
-            : loadStatus === "error"
-              ? { label: "Error", variant: "error" }
-              : { label: "Loaded", variant: "favorable" }
-        }
-      />
+      <TopBar title="Data Explorer" dataStatus={dataStatus} />
 
       <PageContainer>
         <div className="flex flex-wrap items-start justify-between gap-3">
@@ -269,15 +314,17 @@ export default function DataExplorerPage() {
               Interval records
             </h2>
             <p className="mt-1 max-w-[72ch] text-caption leading-caption text-text-tertiary">
-              Raw January 2026 records: WINDFOR forecasts (multiple per interval) and
-              FUELHH actuals. Forecast selection (D‑1 09:00 London cutoff) and
-              alignment are not applied — rows show all retrieved records.
-              Missing cells show "—", never zero.
+              Raw January 2026 records: WINDFOR forecasts (multiple publication
+              versions per interval) and FUELHH actuals. Day-ahead forecast
+              selection and alignment are not applied here — rows show all
+              retrieved records. Pages are computed by the backend, so only the
+              visible page is transferred. Missing cells show “{PLACEHOLDER}”,
+              never zero.
             </p>
           </div>
           <Button
             disabled
-            title="Export becomes available once interval records are loaded"
+            title="CSV export is not available while records are paginated on the server"
             className="min-h-11 md:min-h-9"
           >
             <IconDownload size={14} /> Export CSV
@@ -288,16 +335,15 @@ export default function DataExplorerPage() {
           summary={
             <>
               <SummaryChip>{timeZone}</SummaryChip>
-              <SummaryChip>{statusLabel}</SummaryChip>
-              {matchedOnly ? <SummaryChip>Matched only</SummaryChip> : null}
+              <SummaryChip>
+                {status === "all" ? "All statuses" : status}
+              </SummaryChip>
+              {matchedOnly ? (
+                <SummaryChip>Both values only</SummaryChip>
+              ) : null}
             </>
           }
-          onReset={() => {
-            setTimeZone("Europe/London");
-            setStatus("all");
-            setMatchedOnly(false);
-            setPagination({ page: 1, perPage: 50, totalRecords: 0, totalPages: 1 });
-          }}
+          onReset={resetFilters}
           resetDisabled={!filtersActive}
           actions={
             <Button
@@ -306,9 +352,12 @@ export default function DataExplorerPage() {
               onClick={handleRefresh}
               disabled={isRefreshing}
               aria-busy={isRefreshing}
-              title="Refresh data from backend"
+              title="Rebuild the data from Elexon and bypass the prepared cache"
             >
-              <IconRetry size={14} className={isRefreshing ? "animate-spin" : ""} />{" "}
+              <IconRetry
+                size={14}
+                className={isRefreshing ? "animate-spin" : ""}
+              />{" "}
               <span className="hidden sm:inline">
                 {isRefreshing ? "Refreshing…" : "Refresh"}
               </span>
@@ -336,139 +385,87 @@ export default function DataExplorerPage() {
               <Select
                 id="explorer-status"
                 value={status}
-                onChange={(event) =>
-                  setStatus(event.target.value as StatusFilter)
-                }
+                onChange={(event) => {
+                  setStatus(event.target.value as StatusFilter);
+                  setPage(1);
+                }}
               >
                 <option value="all">All statuses</option>
-                <option value="Matched">Matched</option>
-                <option value="No eligible forecast">No eligible forecast</option>
+                <option value="Source data only">Source data only</option>
+                <option value="No eligible forecast">
+                  No eligible forecast
+                </option>
                 <option value="No actual">No actual</option>
                 <option value="Invalid">Invalid</option>
-                <option value="Source data only">Source data only</option>
               </Select>
             </Field>
 
             <div className="flex min-h-11 items-center sm:min-h-9">
               <Toggle
-                label="Matched only"
+                label="Both values only"
                 checked={matchedOnly}
-                onChange={setMatchedOnly}
-                description="Hide unmatched and invalid intervals"
+                onChange={(checked) => {
+                  setMatchedOnly(checked);
+                  setPage(1);
+                }}
+                description="Hide rows without a forecast or actual value"
               />
             </div>
 
             <p className="max-w-[42ch] pb-1 text-[11px] leading-4 text-text-tertiary sm:ml-auto">
-              Filters narrow the January 2026 interval set. The publication
-              cutoff stays fixed and is never changed by this toolbar.
+              Filters narrow the January 2026 interval set on the server. The
+              publication cutoff stays fixed and is never changed by this
+              toolbar.
             </p>
           </div>
         </FilterBar>
 
-        {loadStatus === "error" ? (
+        {!busy && loadState === "error" ? (
           <StateBlock
             kind="error"
             title="Backend unavailable"
-            description={errorMessage ?? "The backend could not be reached."}
+            description={
+              envelope
+                ? `${errorMessage ?? "The last refresh failed."} Showing the last successfully loaded page from ${formatZonedTime(lastSuccessAt, timeZone)}; it is not marked as loaded.`
+                : (errorMessage ?? "The backend could not be reached.")
+            }
+            action={<RetryButton onClick={handleRefresh} />}
           />
         ) : null}
+
         <DataQualityPanel
-          items={
-            loadStatus === "success" && windforData && fuelhhData
-              ? [
-                  {
-                    label: "Forecast records retrieved (WINDFOR)",
-                    value: (
-                      windforData.meta.recordCounts.WINDFOR ??
-                      windforData.quality.accepted ??
-                      windforData.data.length ??
-                      0
-                    ).toLocaleString("en-GB"),
-                  },
-                  {
-                    label: "Actual records retrieved (FUELHH)",
-                    value: (
-                      fuelhhData.meta.recordCounts.FUELHH ??
-                      fuelhhData.quality.accepted ??
-                      fuelhhData.data.length ??
-                      0
-                    ).toLocaleString("en-GB"),
-                  },
-                  {
-                    label: "Null or invalid values",
-                    value: (
-                      windforData.quality.nullGeneration +
-                      fuelhhData.quality.nullGeneration +
-                      windforData.quality.rejected +
-                      fuelhhData.quality.rejected
-                    ).toLocaleString("en-GB"),
-                  },
-                  {
-                    label: "Time resolution — WINDFOR",
-                    value: windforData.meta.observedResolutions.WINDFOR
-                      ?.delivery.label ?? "Not available",
-                  },
-                  {
-                    label: "Time resolution — FUELHH",
-                    value: fuelhhData.meta.observedResolutions.FUELHH
-                      ?.delivery.label ?? "Not available",
-                  },
-                  {
-                    label: "Data freshness",
-                    value: windforData.meta.retrievedAt ??
-                      fuelhhData.meta.retrievedAt ??
-                      "Not available",
-                  },
-                  {
-                    label: "Validation checks",
-                    value:
-                      windforData.quality.checks.every((check) => check.passed) &&
-                      fuelhhData.quality.checks.every((check) => check.passed)
-                        ? "All passed"
-                        : "See details",
-                  },
-                ]
-              : emptyQualityItems()
-          }
-          summary={
-            loadStatus === "loading"
-              ? { label: "Loading", variant: "neutral" }
-              : loadStatus === "error"
-                ? { label: "Error", variant: "error" }
-                : { label: "Loaded", variant: "favorable" }
-          }
-          state={loadStatus === "loading" ? "loading" : "ready"}
+          items={qualityItems}
+          summary={dataStatus}
+          state={busy && !envelope ? "loading" : "ready"}
         />
+
         <DataExplorerTable
           rows={rows}
           state={
-            loadStatus === "loading"
+            busy
               ? "loading"
-              : loadStatus === "error"
+              : loadState === "error" && envelope === null
                 ? "error"
                 : "ready"
           }
           filtersActive={filtersActive}
-          onClearFilters={() => {
-            setTimeZone("Europe/London");
-            setStatus("all");
-            setMatchedOnly(false);
-            setPagination({ page: 1, perPage: 50, totalRecords: 0, totalPages: 1 });
-          }}
+          onClearFilters={resetFilters}
           timeZoneLabel={timeZone}
           pagination={pagination}
-          onPageChange={(newPage: number) => {
-            setPagination({ ...pagination, page: newPage });
+          onPageChange={setPage}
+          onPerPageChange={(newPerPage) => {
+            setPerPage(newPerPage);
+            setPage(1);
           }}
-          onPerPageChange={(newPerPage: number) => {
-            setPagination({
-              ...pagination,
-              perPage: newPerPage,
-              page: 1,
-            });
+          sort={sortKey}
+          direction={sortDirection}
+          onSortChange={(key, direction) => {
+            setSortKey(key);
+            setSortDirection(direction);
+            setPage(1);
           }}
         />
       </PageContainer>
     </>
   );
-}
+}

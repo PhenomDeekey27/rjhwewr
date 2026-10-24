@@ -186,6 +186,125 @@ describe("DataExplorerTable pagination", () => {
   });
 });
 
+describe("DataExplorerTable controlled (server) pagination", () => {
+  const pageRows = createMockRows(100).slice(25, 50);
+  const pagination = {
+    page: 2,
+    perPage: 25,
+    totalRecords: 100,
+    totalPages: 4,
+  };
+
+  it("renders exactly the supplied page without slicing it again", () => {
+    render(
+      <DataExplorerTable
+        rows={pageRows}
+        state="ready"
+        pagination={pagination}
+        onPageChange={vi.fn()}
+        onPerPageChange={vi.fn()}
+      />,
+    );
+
+    expect(getTableRows()).toHaveLength(25);
+    expect(screen.getByText(/Showing 26–50 of 100/)).toBeInTheDocument();
+    expect(screen.getByText(/Page 2 of 4/)).toBeInTheDocument();
+    expect(getCellText(getTableRows()[0], 0)).toContain("2026-01-26");
+  });
+
+  it("requests the previous and next page through callbacks", () => {
+    const onPageChange = vi.fn();
+    render(
+      <DataExplorerTable
+        rows={pageRows}
+        state="ready"
+        pagination={pagination}
+        onPageChange={onPageChange}
+        onPerPageChange={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /next/i }));
+    expect(onPageChange).toHaveBeenLastCalledWith(3);
+
+    fireEvent.click(screen.getByRole("button", { name: /previous/i }));
+    expect(onPageChange).toHaveBeenLastCalledWith(1);
+  });
+
+  it("disables next on the last page and previous on the first", () => {
+    const { rerender } = render(
+      <DataExplorerTable
+        rows={createMockRows(25)}
+        state="ready"
+        pagination={{ page: 4, perPage: 25, totalRecords: 100, totalPages: 4 }}
+        onPageChange={vi.fn()}
+        onPerPageChange={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("button", { name: /next/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /previous/i })).not.toBeDisabled();
+
+    rerender(
+      <DataExplorerTable
+        rows={pageRows}
+        state="ready"
+        pagination={{ page: 1, perPage: 25, totalRecords: 100, totalPages: 4 }}
+        onPageChange={vi.fn()}
+        onPerPageChange={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("button", { name: /previous/i })).toBeDisabled();
+  });
+
+  it("reports page-size changes instead of slicing locally", () => {
+    const onPerPageChange = vi.fn();
+    render(
+      <DataExplorerTable
+        rows={pageRows}
+        state="ready"
+        pagination={pagination}
+        onPageChange={vi.fn()}
+        onPerPageChange={onPerPageChange}
+      />,
+    );
+
+    fireEvent.change(
+      screen.getByRole("combobox", { name: /rows per page/i }),
+      { target: { value: "100" } },
+    );
+
+    expect(onPerPageChange).toHaveBeenCalledWith(100);
+    expect(getTableRows()).toHaveLength(25);
+  });
+
+  it("delegates sorting and renders rows in server order", () => {
+    const onSortChange = vi.fn();
+    const unsorted = [
+      { ...createMockRows(1)[0], deliveryTime: "2026-01-03T00:00:00Z" },
+      { ...createMockRows(1)[0], deliveryTime: "2026-01-01T00:00:00Z" },
+    ];
+    render(
+      <DataExplorerTable
+        rows={unsorted}
+        state="ready"
+        pagination={{ page: 1, perPage: 25, totalRecords: 2, totalPages: 1 }}
+        onPageChange={vi.fn()}
+        onPerPageChange={vi.fn()}
+        sort="deliveryTime"
+        direction="asc"
+        onSortChange={onSortChange}
+      />,
+    );
+
+    // The server's order is kept until the server answers with a new sort.
+    expect(getCellText(getTableRows()[0], 0)).toContain("2026-01-03");
+
+    fireEvent.click(screen.getByRole("button", { name: /^Forecast MW$/i }));
+    expect(onSortChange).toHaveBeenCalledWith("forecastMw", "asc");
+    expect(getTableRows()).toHaveLength(2);
+  });
+});
+
 describe("DataExplorerTable sorting", () => {
   it("sorts by delivery time ascending by default", () => {
     const rows = [

@@ -6,7 +6,6 @@ import {
   KpiCell,
   KpiStat,
   KpiStrip,
-  UnavailableKpi,
 } from "@/components/ui/KpiStat";
 import { Panel } from "@/components/ui/Panel";
 import { AssumptionBadge } from "@/components/ui/AssumptionBadge";
@@ -18,15 +17,17 @@ import { PageContainer } from "@/components/layout/PageContainer";
 import { StateBlock } from "@/components/ui/StateBlock";
 import { FilterBar } from "@/components/ui/FilterBar";
 import { DateInput, Field } from "@/components/ui/controls";
-import { PLACEHOLDER } from "@/lib/format";
+import { PLACEHOLDER, formatCount, formatPercent, formatSignedMw } from "@/lib/format";
 import { cutoffRuleLabel } from "@/lib/config";
 import {
   fetchWindFor,
   fetchFuelHh,
+  fetchForecastAccuracy,
   clearCache,
   type Envelope,
   type WindForRecord,
   type FuelHhRecord,
+  type AccuracyEnvelope,
 } from "@/lib/api";
 import { Button } from "@/components/ui/controls";
 import { IconArrowRight, IconTable, IconRetry } from "@/components/ui/icons";
@@ -53,10 +54,15 @@ function SummaryChip({ children }: { children: React.ReactNode }) {
 }
 
 const TIMESERIES_DESCRIPTION =
-  "Raw WINDFOR forecast records (teal, multiple per delivery interval) and FUELHH actual outturn (navy) for January 2026. Forecast selection (D‑1 09:00 London cutoff) and alignment are not applied at this stage — lines show all retrieved records.";
+  "All raw WINDFOR publication versions (teal, multiple per delivery interval) and FUELHH actual outturn (navy) for January 2026. This chart shows raw records; the selected day-ahead forecast and matched accuracy are on Forecast Analysis.";
 
 const ERROR_DESCRIPTION =
-  "Signed forecast error (F − A) requires matched forecast and actual intervals. Stage 3 provides raw records only; forecast selection and error computation arrive in Stage 4.";
+  "Signed error (F − A) for the latest WINDFOR forecast published at or before the D‑1 09:00 London cutoff, matched to FUELHH half-hourly actuals. Above zero is over-forecast; only matched intervals are plotted.";
+
+const MONTH_DOMAIN: [number, number] = [
+  Date.parse("2026-01-01T00:00:00Z"),
+  Date.parse("2026-02-01T00:00:00Z"),
+];
 
 function toSeriesPoints(
   records: Array<{ startTime: string; generation: number | null }>,
@@ -122,20 +128,27 @@ export default function OverviewPage() {
   const [status, setStatus] = useState<"loading" | "success" | "error">("loading");
   const [windforData, setWindforData] = useState<Envelope<WindForRecord> | null>(null);
   const [fuelhhData, setFuelhhData] = useState<Envelope<FuelHhRecord> | null>(null);
+  const [accuracyData, setAccuracyData] = useState<AccuracyEnvelope | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
 
   const loadData = useCallback(async () => {
     setIsRefreshing(true);
     try {
-      const [windforResult, fuelhhResult] = await Promise.all([fetchWindFor(), fetchFuelHh()]);
+      const [windforResult, fuelhhResult, accuracyResult] = await Promise.all([
+        fetchWindFor(),
+        fetchFuelHh(),
+        fetchForecastAccuracy(),
+      ]);
       setWindforData(windforResult);
       setFuelhhData(fuelhhResult);
+      setAccuracyData(accuracyResult);
       setStatus("success");
       setErrorMessage(null);
     } catch (error) {
       setWindforData(null);
       setFuelhhData(null);
+      setAccuracyData(null);
       setStatus("error");
       setErrorMessage(error instanceof Error ? error.message : "Backend unavailable");
     } finally {
@@ -152,6 +165,7 @@ export default function OverviewPage() {
   const handleRefresh = useCallback(() => {
     clearCache("/api/elexon/windfor");
     clearCache("/api/elexon/fuelhh");
+    clearCache("/api/elexon/forecast-accuracy");
     loadData();
   }, [loadData]);
 
@@ -179,6 +193,18 @@ export default function OverviewPage() {
             }
           : { label: "Partial data", variant: "warning" as const };
 
+  const summary = accuracyData?.data.summary;
+  const matchedCount = summary?.matchedIntervals ?? 0;
+  const expectedCount = summary?.expectedIntervals ?? 0;
+  const biasDirection =
+    summary?.bias === null || summary?.bias === undefined
+      ? "—"
+      : summary.bias > 0
+        ? "over-forecast"
+        : summary.bias < 0
+          ? "under-forecast"
+          : "no bias";
+
   const qualityItems =
     status === "success" && windforData && fuelhhData
       ? [
@@ -192,18 +218,23 @@ export default function OverviewPage() {
           },
           {
             label: "Expected delivery intervals",
-            value: "—",
-            note: "Not provided by backend",
+            value: formatCount(expectedCount),
+            note: "Computed from the window and detected resolution",
           },
           {
             label: "Matched intervals",
-            value: "—",
-            note: "Forecast selection arrives in Stage 4",
+            value: `${formatCount(matchedCount)} / ${formatCount(expectedCount)}`,
+            note: "Eligible forecast · complete actual coverage",
           },
           {
             label: "Missing matches",
-            value: "—",
-            note: "Forecast selection arrives in Stage 4",
+            value: formatCount(
+              Object.values(accuracyData?.data.missing.byReason ?? {}).reduce(
+                (sum, count) => sum + count,
+                0,
+              ),
+            ),
+            note: "Counted by reason, never zero-filled",
           },
           {
             label: "Null or invalid values",
@@ -278,6 +309,20 @@ export default function OverviewPage() {
     [from, to],
   );
 
+  const monthErrorBars = useMemo(
+    () =>
+      (accuracyData?.data.intervals ?? [])
+        .filter(
+          (interval) =>
+            interval.status === "matched" && interval.error !== null,
+        )
+        .map((interval) => ({
+          t: Date.parse(interval.deliveryTime),
+          v: interval.error as number,
+        })),
+    [accuracyData],
+  );
+
   return (
     <>
       <TopBar title="Overview" dataStatus={dataStatus} />
@@ -349,7 +394,8 @@ export default function OverviewPage() {
                 Forecast accuracy
               </h2>
               <p className="text-caption leading-caption text-text-tertiary">
-                Matched intervals only · January 2026 delivery
+                Matched intervals only · January 2026 delivery ·{" "}
+                {summary?.unit ?? "MW"}
               </p>
             </div>
             <p className="text-[11px] leading-4 text-text-tertiary">
@@ -359,10 +405,15 @@ export default function OverviewPage() {
 
           <KpiStrip>
             <KpiCell>
-              <UnavailableKpi
+              <KpiStat
                 label="MAE"
+                value={
+                  summary?.mae === null || summary?.mae === undefined
+                    ? PLACEHOLDER
+                    : formatCount(summary.mae)
+                }
                 unit="MW"
-                context="n = — matched intervals · awaits data"
+                context={`n = ${formatCount(matchedCount)} of ${formatCount(expectedCount)} intervals`}
                 tooltip={{
                   definition:
                     "Mean absolute error: the typical size of the forecast miss, ignoring direction. Lower is better.",
@@ -372,10 +423,15 @@ export default function OverviewPage() {
               />
             </KpiCell>
             <KpiCell>
-              <UnavailableKpi
+              <KpiStat
                 label="RMSE"
+                value={
+                  summary?.rmse === null || summary?.rmse === undefined
+                    ? PLACEHOLDER
+                    : formatCount(summary.rmse)
+                }
                 unit="MW"
-                context="n = — matched intervals · awaits data"
+                context={`n = ${formatCount(matchedCount)} of ${formatCount(expectedCount)} intervals`}
                 tooltip={{
                   definition:
                     "Root mean square error: like MAE but penalises large misses more heavily.",
@@ -388,13 +444,17 @@ export default function OverviewPage() {
               <KpiStat
                 label="Bias"
                 value={
-                  <span className="text-text-tertiary">
-                    {PLACEHOLDER}
-                    <span className="sr-only">Not available</span>
-                  </span>
+                  summary?.bias === null || summary?.bias === undefined ? (
+                    PLACEHOLDER
+                  ) : (
+                    <>
+                      {formatSignedMw(summary.bias).sign}
+                      {formatSignedMw(summary.bias).abs}
+                    </>
+                  )
                 }
                 unit="MW (signed)"
-                context="+ over-forecast · − under-forecast · n = —"
+                context={`${biasDirection} · n = ${formatCount(matchedCount)}`}
                 align="right"
                 tooltip={{
                   definition:
@@ -405,10 +465,10 @@ export default function OverviewPage() {
               />
             </KpiCell>
             <KpiCell>
-              <UnavailableKpi
+              <KpiStat
                 label="Matched coverage"
-                unit="%"
-                context="— / — expected intervals"
+                value={formatPercent(summary?.coveragePercent ?? null)}
+                context={`${formatCount(matchedCount)} / ${formatCount(expectedCount)} intervals`}
                 align="right"
                 tooltip={{
                   definition:
@@ -448,7 +508,7 @@ export default function OverviewPage() {
         </ChartPanel>
 
         <ChartPanel
-          title="Forecast error (F − A) — not available in Stage 3"
+          title="Forecast error (F − A) — January 2026"
           description={ERROR_DESCRIPTION}
           legend={[
             { label: "Over-forecast", kind: "area", color: "positive" },
@@ -457,9 +517,12 @@ export default function OverviewPage() {
           ]}
         >
           <ErrorChart
-            emptyTitle="Error data requires forecast selection"
-            emptyDescription="Signed error appears once eligible forecasts are matched to actuals (Stage 4)."
-            ariaLabel="Forecast error for January 2026. Not available in Stage 3."
+            bars={monthErrorBars}
+            domain={monthErrorBars.length > 0 ? MONTH_DOMAIN : undefined}
+            xTitle="Delivery day (Europe/London) · January 2026"
+            emptyTitle="No matched intervals"
+            emptyDescription="Signed error appears once eligible forecasts are matched to actuals."
+            ariaLabel={`Forecast error for January 2026. ${monthErrorBars.length} matched intervals.`}
           />
         </ChartPanel>
 

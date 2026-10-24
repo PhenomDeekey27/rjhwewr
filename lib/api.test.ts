@@ -1,9 +1,19 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, fetchJson, fetchWindFor, fetchFuelHh, fetchJanuary2026Summary, clearCache } from "./api";
+import {
+  ApiError,
+  fetchJson,
+  fetchWindFor,
+  fetchFuelHh,
+  fetchJanuary2026Summary,
+  fetchExplorerRecords,
+  fetchForecastAccuracy,
+  clearCache,
+} from "./api";
 
 describe("fetchJson", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    clearCache();
   });
 
   it("returns parsed JSON on success", async () => {
@@ -119,5 +129,91 @@ describe("API endpoint functions", () => {
     const result = await fetchJanuary2026Summary();
     expect(result.data).toHaveLength(1);
     expect(result.data[0].dataset).toBe("WINDFOR");
+  });
+});
+
+describe("server-side pagination queries", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    clearCache();
+  });
+
+  const mockOk = () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => ({ data: [], meta: {}, quality: {} }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  };
+
+  it("sends page, page size, sort and filters to the explorer endpoint", async () => {
+    const fetchMock = mockOk();
+
+    await fetchExplorerRecords({
+      page: 2,
+      perPage: 25,
+      sort: "errorMw",
+      direction: "desc",
+      status: "Source data only",
+      matchedOnly: true,
+    });
+
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain("/api/elexon/explorer?");
+    expect(url).toContain("page=2");
+    expect(url).toContain("perPage=25");
+    expect(url).toContain("sort=errorMw");
+    expect(url).toContain("direction=desc");
+    expect(url).toContain("status=Source+data+only");
+    expect(url).toContain("matchedOnly=true");
+  });
+
+  it("omits empty filters", async () => {
+    const fetchMock = mockOk();
+
+    await fetchExplorerRecords({ page: 1, perPage: 50 });
+
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).not.toContain("status=");
+    expect(url).not.toContain("matchedOnly=");
+  });
+
+  it("caches each page separately and never returns another page's rows", async () => {
+    const fetchMock = mockOk();
+
+    await fetchExplorerRecords({ page: 1, perPage: 50 });
+    await fetchExplorerRecords({ page: 2, perPage: 50 });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    // Repeating page 1 is a cache hit; repeating page 2 would be too.
+    await fetchExplorerRecords({ page: 1, perPage: 50 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("refresh bypasses the cache and asks the backend to rebuild", async () => {
+    const fetchMock = mockOk();
+
+    await fetchExplorerRecords({ page: 1, perPage: 50 });
+    await fetchExplorerRecords(
+      { page: 1, perPage: 50 },
+      { refresh: true },
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(String(fetchMock.mock.calls[1][0])).toContain("refresh=true");
+  });
+
+  it("fetches the accuracy payload without turning it into rows", async () => {
+    const fetchMock = mockOk();
+
+    await fetchForecastAccuracy();
+
+    expect(String(fetchMock.mock.calls[0][0])).toContain(
+      "/api/elexon/forecast-accuracy",
+    );
   });
 });

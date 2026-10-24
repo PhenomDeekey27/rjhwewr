@@ -222,7 +222,7 @@ export default function MethodologyPage() {
                 <div>
                   <dt className="text-text-tertiary">Data status</dt>
                   <dd className="mt-0.5 font-medium text-text-primary">
-                    Backend records not loaded
+                    Shown per page · backend-reported
                   </dd>
                 </div>
               </dl>
@@ -271,8 +271,10 @@ export default function MethodologyPage() {
                       settlementPeriod, generation
                     </Td>
                     <Td>
-                      {UNITS.generation}{" "}
-                      <span className="text-text-tertiary">(pending check)</span>
+                      {UNITS.generation}
+                      <span className="block text-[11px] leading-4 text-text-tertiary">
+                        single value per interval
+                      </span>
                     </Td>
                   </tr>
                   <tr>
@@ -283,26 +285,36 @@ export default function MethodologyPage() {
                       generation
                     </Td>
                     <Td>
-                      {UNITS.generation}{" "}
-                      <span className="text-text-tertiary">(pending check)</span>
+                      {UNITS.generation}
+                      <span className="block text-[11px] leading-4 text-text-tertiary">
+                        average over the half-hour
+                      </span>
                     </Td>
                   </tr>
                 </TableShell>
               </Section>
 
               <Section id="units" title="Units">
-                <Callout title="Pending verification">
+                <Callout title="Verified against Elexon documentation">
                   <p>
-                    Elexon documentation describes the{" "}
-                    <InlineCode>generation</InlineCode> fields for both datasets
-                    as <strong>{UNITS.generation}</strong> (power). This has not
-                    yet been confirmed against the live OpenAPI specification.
-                    The UI reads its unit label from one constant; if FUELHH is
-                    an average over the half-hour, that will be stated here.
+                    Both <InlineCode>generation</InlineCode> fields are power in{" "}
+                    <strong>{UNITS.generation}</strong>, not energy in MWh. WINDFOR
+                    is a single forecast value per delivery interval; Elexon
+                    labels the peak wind forecast in MW. FUELHH is the average
+                    MW over each settlement period, not a half-hour energy
+                    total. Values are therefore compared directly, without
+                    multiplying by duration or summing intervals.
                   </p>
-                  <p className="mt-2 text-[11px] text-text-tertiary">
-                    Last repository review: 24 October 2026. Live OpenAPI check:
-                    outstanding.
+                  <p className="mt-2">
+                    Elexon&apos;s own wind-forecast reporting compares WINDFOR
+                    with FUELHH wind outturn, for wind farms metered on the GB
+                    transmission network. This dashboard uses the same pairing.
+                  </p>
+                  <p className="mt-2 text-[11px] leading-4 text-text-tertiary">
+                    Sources: Elexon Insights API dataset documentation (WINDFOR,
+                    FUELHH) and the BMRA &amp; SAA Interface Specification
+                    (FUELHH generation: units MW, half-hourly average period
+                    values). Checked 24 October 2026.
                   </p>
                 </Callout>
                 <p>
@@ -399,31 +411,38 @@ export default function MethodologyPage() {
               <Section id="alignment" title="Matching and alignment">
                 <ul className="list-disc space-y-2 pl-5 marker:text-text-tertiary">
                   <li>
-                    Rows are joined on delivery interval identity —{" "}
-                    <InlineCode>startTime</InlineCode>, or{" "}
-                    <InlineCode>settlementDate</InlineCode> +{" "}
-                    <InlineCode>settlementPeriod</InlineCode> — with the two
-                    keys validated to agree.
+                    Forecast intervals are identified by their UTC{" "}
+                    <InlineCode>startTime</InlineCode>. FUELHH settlement date
+                    and period are carried through for reference; the match is
+                    made on the interval start, and a record without a matching
+                    start is reported as unmatched rather than merged on a
+                    different key.
                   </li>
                   <li>
-                    At the same resolution, the match is one-to-one. FUELHH is
-                    expected to be half-hourly; the WINDFOR resolution must be
-                    observed from the data, not assumed.
+                    WINDFOR is hourly and FUELHH is half-hourly in this window.
+                    Each hourly forecast interval <em>[t, t + 60 min)</em> is
+                    compared with the time-weighted mean of the two FUELHH
+                    half-hours that exactly cover it. Both resolutions are
+                    detected from the data and shown in Data Quality.
                   </li>
                   <li>
-                    If forecast resolution is coarser, the alignment method is
-                    named in the interface and in Data Quality, with the count
-                    of intervals affected. There is no interpolation, no
-                    duplication of forecast values into finer slots and no
-                    silent aggregation.
+                    An interval is matched only when every required half-hour
+                    actual is present and non-null. If one is missing, the
+                    interval is excluded from every metric and counted by
+                    reason: there is no interpolation, no duplication of a
+                    forecast into finer slots and no mean over a partial
+                    interval.
                   </li>
                   <li>
-                    Null or invalid values are excluded and counted. They are
-                    never treated as zero.
+                    The accuracy result has one row per delivery interval, not
+                    one per publication. The selected publication is kept beside
+                    each interval so the choice can be traced.
                   </li>
                   <li>
-                    Join integrity, duplicate keys and timestamp parsing are
-                    validated before a KPI is allowed to render.
+                    Null or invalid values are excluded and counted; they are
+                    never treated as zero. Join integrity, duplicate keys and
+                    timestamp parsing are validated, and failed checks are
+                    displayed rather than hidden.
                   </li>
                 </ul>
               </Section>
@@ -489,8 +508,8 @@ export default function MethodologyPage() {
                   The expected interval count is computed by the backend, not
                   hard-coded in the UI. Until accuracy thresholds are agreed,
                   KPIs use neutral status and no red/amber judgement of
-                  accuracy. Rounding happens only at presentation; exports keep
-                  full precision.
+                  accuracy. Rounding happens only at presentation; the API
+                  returns unrounded values.
                 </p>
               </Section>
 
@@ -518,9 +537,9 @@ export default function MethodologyPage() {
                   ))}
                 </ul>
                 <p className="text-[11px] leading-4 text-text-tertiary">
-                  None of these checks has run yet: no January 2026 records are
-                  loaded. The dashboard does not display a passed state until
-                  the backend reports one.
+                  The backend runs these checks on the loaded January 2026
+                  snapshot, and each page shows how many passed. A failed check
+                  is displayed as failed; the UI never assumes a pass.
                 </p>
               </Section>
 
@@ -529,7 +548,7 @@ export default function MethodologyPage() {
                   <li>Results describe January 2026 only and do not generalise to other seasons.</li>
                   <li>Metrics depend on the cutoff assumption; a different cutoff changes forecast selection.</li>
                   <li>The national aggregate hides regional variation.</li>
-                  <li>FUELHH is outturn-based; later revisions are not tracked (pending verification).</li>
+                  <li>FUELHH is outturn-based; the dashboard reports the snapshot retrieved at load time and does not track later revisions.</li>
                   <li>{UNITS.generation} metrics are not normalised by installed capacity.</li>
                   <li>Error metrics do not capture financial impact.</li>
                   <li>Forecast and actual resolution differences may limit which intervals can be compared.</li>
@@ -558,31 +577,37 @@ export default function MethodologyPage() {
                       id: "1",
                       text: "Day-ahead cutoff is D‑1 09:00 Europe/London",
                       status: "Needs confirmation",
+                      variant: "warning" as const,
                     },
                     {
                       id: "2",
                       text: "Selection uses the latest forecast published at or before the cutoff",
-                      status: "Open",
+                      status: "Implemented · depends on 1",
+                      variant: "info" as const,
                     },
                     {
                       id: "3",
                       text: "Generation unit is MW, not MWh, for both datasets",
-                      status: "Pending OpenAPI check",
+                      status: "Verified 24 Oct 2026",
+                      variant: "favorable" as const,
                     },
                     {
                       id: "4",
-                      text: "WINDFOR resolution is observed from data rather than assumed",
-                      status: "Open",
+                      text: "WINDFOR and FUELHH resolutions are observed from data rather than assumed",
+                      status: "Implemented",
+                      variant: "favorable" as const,
                     },
                     {
                       id: "5",
-                      text: "Alignment method for a resolution mismatch is chosen and validated",
-                      status: "Open",
+                      text: "Hourly forecasts are compared with the mean of the half-hour actuals that exactly cover them",
+                      status: "Implemented",
+                      variant: "favorable" as const,
                     },
                     {
                       id: "6",
                       text: "Publication fetch window includes late December 2025",
-                      status: "Open",
+                      status: "Implemented",
+                      variant: "favorable" as const,
                     },
                   ].map((item) => (
                     <tr key={item.id}>
@@ -593,7 +618,7 @@ export default function MethodologyPage() {
                       </Td>
                       <Td>{item.text}</Td>
                       <Td>
-                        <StatusChip variant="warning" label={item.status} />
+                        <StatusChip variant={item.variant} label={item.status} />
                       </Td>
                     </tr>
                   ))}

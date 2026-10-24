@@ -183,19 +183,33 @@ class ElexonClient:
         self.max_retries = max_retries
         self.backoff_seconds = backoff_seconds
         self._sleep = sleep
-        self._client = httpx.Client(
-            base_url=self.base_url,
-            timeout=timeout,
-            transport=transport,
-            headers={
+        # Creating an httpx.Client builds an SSL context (~0.1-0.2 s on
+        # Windows). Most requests are answered from the prepared cache and
+        # never touch the network, so the client is created on first use.
+        self._client_options = {
+            "timeout": timeout,
+            "transport": transport,
+            "headers": {
                 "Accept": "application/json",
                 "User-Agent": USER_AGENT,
             },
-            follow_redirects=True,
-        )
+            "follow_redirects": True,
+        }
+        self._client: httpx.Client | None = None
+
+    @property
+    def http(self) -> httpx.Client:
+        """The underlying HTTP client, created lazily on first request."""
+        if self._client is None:
+            self._client = httpx.Client(
+                base_url=self.base_url, **self._client_options
+            )
+        return self._client
 
     def close(self) -> None:
-        self._client.close()
+        if self._client is not None:
+            self._client.close()
+            self._client = None
 
     def __enter__(self) -> "ElexonClient":
         return self
@@ -255,7 +269,7 @@ class ElexonClient:
         for attempt in range(attempts):
             retry_after: float | None = None
             try:
-                response = self._client.get(path, params=params)
+                response = self.http.get(path, params=params)
             except httpx.TimeoutException as exc:
                 last_error = ElexonTimeoutError()
             except httpx.TransportError as exc:

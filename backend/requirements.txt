@@ -2,3 +2,6 @@ fastapi==0.115.0
 uvicorn[standard]==0.32.1
 python-dotenv==1.0.1
 httpx==0.28.1
+# IANA time-zone data for zoneinfo on hosts without a system tz database
+# (notably Windows), used for the Europe/London D-1 cutoff.
+tzdata==2026.5
