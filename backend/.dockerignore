@@ -1,0 +1,30 @@
+# Virtual environments
+.venv
+venv
+env
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Git files
+.git/
+.gitignore
+
+# Logs and debug
+*.log
+.env*
+
+# Next.js / frontend build output
+/.next/
+/out/
+
+# TypeScript build info
+*.tsbuildinfo
+
+# Misc
+.DS_Store
