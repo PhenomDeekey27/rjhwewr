@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import {
   KpiCell,
@@ -15,11 +15,21 @@ import { TimeSeriesChart, ErrorChart } from "@/components/charts/TimeSeriesChart
 import { DataQualityPanel, emptyQualityItems } from "@/components/dashboard/DataQualityPanel";
 import { TopBar } from "@/components/layout/TopBar";
 import { PageContainer } from "@/components/layout/PageContainer";
+import { StateBlock } from "@/components/ui/StateBlock";
 import { FilterBar } from "@/components/ui/FilterBar";
 import { DateInput, Field } from "@/components/ui/controls";
 import { PLACEHOLDER } from "@/lib/format";
 import { cutoffRuleLabel } from "@/lib/config";
-import { IconArrowRight, IconTable } from "@/components/ui/icons";
+import {
+  fetchWindFor,
+  fetchFuelHh,
+  clearCache,
+  type Envelope,
+  type WindForRecord,
+  type FuelHhRecord,
+} from "@/lib/api";
+import { Button } from "@/components/ui/controls";
+import { IconArrowRight, IconTable, IconRetry } from "@/components/ui/icons";
 
 const DEFAULT_FROM = "2026-01-01";
 const DEFAULT_TO = "2026-01-31";
@@ -43,15 +53,225 @@ function SummaryChip({ children }: { children: React.ReactNode }) {
 }
 
 const TIMESERIES_DESCRIPTION =
-  "Actual (FUELHH, navy) against the eligible day-ahead forecast (WINDFOR, teal) by delivery time. Forecasts here were published before the D‑1 09:00 London cutoff. Lines break at unmatched intervals; nothing is interpolated.";
+  "Raw WINDFOR forecast records (teal, multiple per delivery interval) and FUELHH actual outturn (navy) for January 2026. Forecast selection (D‑1 09:00 London cutoff) and alignment are not applied at this stage — lines show all retrieved records.";
 
 const ERROR_DESCRIPTION =
-  "Signed forecast error, F − A, for each interval. Above the dashed baseline is over-forecast; below is under-forecast. Both directions are errors.";
+  "Signed forecast error (F − A) requires matched forecast and actual intervals. Stage 3 provides raw records only; forecast selection and error computation arrive in Stage 4.";
+
+function toSeriesPoints(
+  records: Array<{ startTime: string; generation: number | null }>,
+): Array<{ t: number; v: number | null }> {
+  return records
+    .filter((r) => r.generation !== null && r.generation !== undefined)
+    .map((r) => ({
+      t: Date.parse(r.startTime),
+      v: r.generation!,
+    }));
+}
+
+function computeDomain(
+  series: Array<{ data: Array<{ t: number; v: number | null }> }>,
+): [number, number] | undefined {
+  const allTimes = series.flatMap((s) => s.data.map((p) => p.t));
+  if (allTimes.length === 0) return undefined;
+  return [Math.min(...allTimes), Math.max(...allTimes)];
+}
+
+// Downsample series for chart display to avoid SVG performance issues with 18k+ points.
+// Uses Largest-Triangle-Three-Buckets (LTTB) algorithm for meaningful downsampling.
+function downsampleSeries(
+  points: Array<{ t: number; v: number | null }>,
+  maxPoints: number,
+): Array<{ t: number; v: number | null }> {
+  const validPoints = points.filter((p) => p.v !== null && p.v !== undefined);
+  if (validPoints.length <= maxPoints) return validPoints;
+
+  // Simple LTTB-like downsampling: divide into buckets, pick max/min/median
+  const bucketSize = validPoints.length / maxPoints;
+  const downsampled: Array<{ t: number; v: number | null }> = [];
+
+  for (let i = 0; i < maxPoints; i++) {
+    const start = Math.floor(i * bucketSize);
+    const end = Math.floor((i + 1) * bucketSize);
+    const bucket = validPoints.slice(start, end);
+    if (bucket.length === 0) continue;
+
+    // Pick the point with maximum absolute deviation from bucket mean (preserves extremes)
+    const mean = bucket.reduce((sum, p) => sum + p.v!, 0) / bucket.length;
+    let maxDev = -1;
+    let selected = bucket[0];
+    for (const p of bucket) {
+      const dev = Math.abs(p.v! - mean);
+      if (dev > maxDev) {
+        maxDev = dev;
+        selected = p;
+      }
+    }
+    downsampled.push(selected);
+  }
+  return downsampled;
+}
+
+const CHART_MAX_POINTS = 500; // Display limit for smooth SVG rendering
 
 export default function OverviewPage() {
   const [from, setFrom] = useState(DEFAULT_FROM);
   const [to, setTo] = useState(DEFAULT_TO);
   const filtersActive = from !== DEFAULT_FROM || to !== DEFAULT_TO;
+
+  const [status, setStatus] = useState<"loading" | "success" | "error">("loading");
+  const [windforData, setWindforData] = useState<Envelope<WindForRecord> | null>(null);
+  const [fuelhhData, setFuelhhData] = useState<Envelope<FuelHhRecord> | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+
+  const loadData = useCallback(async () => {
+    setIsRefreshing(true);
+    try {
+      const [windforResult, fuelhhResult] = await Promise.all([fetchWindFor(), fetchFuelHh()]);
+      setWindforData(windforResult);
+      setFuelhhData(fuelhhResult);
+      setStatus("success");
+      setErrorMessage(null);
+    } catch (error) {
+      setWindforData(null);
+      setFuelhhData(null);
+      setStatus("error");
+      setErrorMessage(error instanceof Error ? error.message : "Backend unavailable");
+    } finally {
+      setIsRefreshing(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      await loadData();
+    })();
+  }, [loadData]);
+
+  const handleRefresh = useCallback(() => {
+    clearCache("/api/elexon/windfor");
+    clearCache("/api/elexon/fuelhh");
+    loadData();
+  }, [loadData]);
+
+  const windforRecordCount = windforData?.meta.recordCounts.WINDFOR ?? windforData?.quality.accepted ?? windforData?.data.length ?? 0;
+  const fuelhhRecordCount = fuelhhData?.meta.recordCounts.FUELHH ?? fuelhhData?.quality.accepted ?? fuelhhData?.data.length ?? 0;
+  const windforRejected = windforData?.quality.rejected ?? 0;
+  const fuelhhRejected = fuelhhData?.quality.rejected ?? 0;
+  const windforNullGen = windforData?.quality.nullGeneration ?? 0;
+  const fuelhhNullGen = fuelhhData?.quality.nullGeneration ?? 0;
+  const allChecksPassed =
+    ((windforData?.quality.checks.length ?? 0) > 0 &&
+      windforData?.quality.checks.every((check) => check.passed) &&
+      (fuelhhData?.quality.checks.length ?? 0) > 0 &&
+      fuelhhData?.quality.checks.every((check) => check.passed)) ??
+    false;
+  const dataStatus =
+    status === "loading"
+      ? { label: "Loading", variant: "neutral" as const }
+      : status === "error"
+        ? { label: "Error", variant: "error" as const }
+        : allChecksPassed
+          ? {
+              label: `Loaded · ${windforData?.meta.retrievedAt ?? fuelhhData?.meta.retrievedAt ?? ""}`.trim(),
+              variant: "favorable" as const,
+            }
+          : { label: "Partial data", variant: "warning" as const };
+
+  const qualityItems =
+    status === "success" && windforData && fuelhhData
+      ? [
+          {
+            label: "Forecast records retrieved (WINDFOR)",
+            value: windforRecordCount.toLocaleString("en-GB"),
+          },
+          {
+            label: "Actual records retrieved (FUELHH)",
+            value: fuelhhRecordCount.toLocaleString("en-GB"),
+          },
+          {
+            label: "Expected delivery intervals",
+            value: "—",
+            note: "Not provided by backend",
+          },
+          {
+            label: "Matched intervals",
+            value: "—",
+            note: "Forecast selection arrives in Stage 4",
+          },
+          {
+            label: "Missing matches",
+            value: "—",
+            note: "Forecast selection arrives in Stage 4",
+          },
+          {
+            label: "Null or invalid values",
+            value: (windforNullGen + fuelhhNullGen + windforRejected + fuelhhRejected).toLocaleString("en-GB"),
+            note: `${windforData.quality.rejectedReasons.outsideDeliveryWindow ?? 0} outside delivery window`,
+          },
+          {
+            label: "Time resolution — WINDFOR",
+            value: windforData.meta.observedResolutions.WINDFOR?.delivery.label ?? "Not available",
+            note: "Detected from data",
+          },
+          {
+            label: "Time resolution — FUELHH",
+            value: fuelhhData.meta.observedResolutions.FUELHH?.delivery.label ?? "Not available",
+            note: "Detected from data",
+          },
+          {
+            label: "Publication window fetched",
+            value:
+              windforData.meta.publicationWindow?.start && windforData.meta.publicationWindow?.endExclusive
+                ? `${windforData.meta.publicationWindow.start} to ${windforData.meta.publicationWindow.endExclusive}`
+                : "Not available",
+          },
+          {
+            label: "Data freshness",
+            value: windforData.meta.retrievedAt ?? fuelhhData.meta.retrievedAt ?? "Not available",
+            note: "Retrieved at",
+          },
+          {
+            label: "Validation checks",
+            value: allChecksPassed ? "All passed" : "See details",
+            note: `${(windforData.quality.checks.filter((c) => c.passed).length + fuelhhData.quality.checks.filter((c) => c.passed).length)}/${windforData.quality.checks.length + fuelhhData.quality.checks.length} passed`,
+          },
+        ]
+      : undefined;
+
+  const windforSeries = useMemo(() => {
+    if (!windforData) return null;
+    const points = toSeriesPoints(windforData.data);
+    if (points.length === 0) return null;
+    // Downsample for chart performance (18k+ points is too many for SVG)
+    const displayPoints = downsampleSeries(points, CHART_MAX_POINTS);
+    return {
+      name: "WINDFOR (all forecasts, downsampled for display)",
+      color: "var(--color-chart-forecast)",
+      data: displayPoints,
+    };
+  }, [windforData]);
+
+  const fuelhhSeries = useMemo(() => {
+    if (!fuelhhData) return null;
+    const points = toSeriesPoints(fuelhhData.data);
+    if (points.length === 0) return null;
+    return {
+      name: "FUELHH (actual)",
+      color: "var(--color-chart-actual)",
+      data: points,
+    };
+  }, [fuelhhData]);
+
+  const chartSeries = useMemo(() => {
+    const series = [windforSeries, fuelhhSeries].filter(
+      (s): s is NonNullable<typeof s> => s !== null,
+    );
+    if (series.length === 0) return { series: [], domain: undefined };
+    const domain = computeDomain(series);
+    return { series, domain };
+  }, [windforSeries, fuelhhSeries]);
 
   const rangeLabel = useMemo(
     () => `${shortDay(from)} – ${shortDay(to)} 2026`,
@@ -60,12 +280,16 @@ export default function OverviewPage() {
 
   return (
     <>
-      <TopBar
-        title="Overview"
-        dataStatus={{ label: "No data loaded", variant: "neutral" }}
-      />
+      <TopBar title="Overview" dataStatus={dataStatus} />
 
       <PageContainer>
+        {status === "error" ? (
+          <StateBlock
+            kind="error"
+            title="Backend unavailable"
+            description={errorMessage ?? "The backend could not be reached."}
+          />
+        ) : null}
         <FilterBar
           summary={<SummaryChip>{rangeLabel}</SummaryChip>}
           onReset={() => {
@@ -73,6 +297,19 @@ export default function OverviewPage() {
             setTo(DEFAULT_TO);
           }}
           resetDisabled={!filtersActive}
+          actions={
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={handleRefresh}
+              disabled={isRefreshing}
+              aria-busy={isRefreshing}
+              title="Refresh data from backend"
+            >
+              <IconRetry size={14} className={isRefreshing ? "animate-spin" : ""} />
+              <span className="hidden sm:inline">{isRefreshing ? "Refreshing…" : "Refresh"}</span>
+            </Button>
+          }
         >
           <div className="grid grid-cols-2 gap-3 sm:flex sm:flex-wrap sm:items-end">
             <Field label="From delivery day" htmlFor="overview-from">
@@ -185,7 +422,7 @@ export default function OverviewPage() {
         </section>
 
         <ChartPanel
-          title="Actual vs eligible day-ahead forecast"
+          title="Raw WINDFOR forecasts and FUELHH actuals"
           description={TIMESERIES_DESCRIPTION}
           actions={
             <Link
@@ -197,16 +434,21 @@ export default function OverviewPage() {
             </Link>
           }
           legend={[
-            { label: "Actual (FUELHH)", kind: "line", color: "actual" },
-            { label: "Day-ahead forecast (WINDFOR)", kind: "line", color: "forecast" },
-            { label: "Missing / unmatched interval", kind: "band", color: "missing" },
+            { label: "FUELHH actual", kind: "line", color: "actual" },
+            { label: "WINDFOR forecasts (all)", kind: "line", color: "forecast" },
           ]}
         >
-          <TimeSeriesChart />
+          <TimeSeriesChart
+            series={chartSeries.series}
+            domain={chartSeries.domain}
+            emptyTitle="No forecast data loaded"
+            emptyDescription="Raw WINDFOR and FUELHH records will plot here once January 2026 data is available."
+            ariaLabel="Raw WINDFOR forecast records and FUELHH actual generation for January 2026. Forecast selection not applied."
+          />
         </ChartPanel>
 
         <ChartPanel
-          title="Forecast error (F − A)"
+          title="Forecast error (F − A) — not available in Stage 3"
           description={ERROR_DESCRIPTION}
           legend={[
             { label: "Over-forecast", kind: "area", color: "positive" },
@@ -214,7 +456,11 @@ export default function OverviewPage() {
             { label: "Forecast = actual", kind: "line", color: "zero", dashed: true },
           ]}
         >
-          <ErrorChart />
+          <ErrorChart
+            emptyTitle="Error data requires forecast selection"
+            emptyDescription="Signed error appears once eligible forecasts are matched to actuals (Stage 4)."
+            ariaLabel="Forecast error for January 2026. Not available in Stage 3."
+          />
         </ChartPanel>
 
         <section
@@ -223,8 +469,9 @@ export default function OverviewPage() {
         >
           <div className="xl:col-span-8">
             <DataQualityPanel
-              items={emptyQualityItems()}
-              summary={{ label: "No data loaded", variant: "neutral" }}
+              items={qualityItems ?? emptyQualityItems()}
+              summary={dataStatus}
+              state={status === "loading" ? "loading" : "ready"}
             />
           </div>
 

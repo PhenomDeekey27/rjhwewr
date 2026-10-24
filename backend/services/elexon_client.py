@@ -52,6 +52,11 @@ MAX_WINDOW_DAYS = 7
 
 USER_AGENT = "wind-forecast-accuracy/0.1 (Stage 3 Elexon integration)"
 
+# In-memory cache for upstream responses (path + params -> response)
+# TTL: 5 minutes (300 seconds) - data is static for January 2026
+_CACHE_TTL_SECONDS = 300
+_cache: dict[str, tuple[float, Any]] = {}
+
 
 class ElexonApiError(Exception):
     """Upstream API failure (HTTP error, bad payload, exhausted retries)."""
@@ -198,6 +203,36 @@ class ElexonClient:
     def __exit__(self, *exc_info: object) -> None:
         self.close()
 
+    @staticmethod
+    def _cache_key(path: str, params: dict[str, Any] | None) -> str:
+        """Generate a deterministic cache key from path and params."""
+        if not params:
+            return path
+        # Sort params for consistent key
+        sorted_params = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        return f"{path}?{sorted_params}"
+
+    def _get_cached(self, path: str, params: dict[str, Any] | None) -> Any | None:
+        """Get cached response if still valid."""
+        key = self._cache_key(path, params)
+        if key in _cache:
+            timestamp, data = _cache[key]
+            if time.time() - timestamp < _CACHE_TTL_SECONDS:
+                print(f"CACHE HIT: {key}")
+                return data
+            else:
+                # Expired
+                print(f"CACHE EXPIRED: {key}")
+                del _cache[key]
+        print(f"CACHE MISS: {key}")
+        return None
+
+    def _set_cached(self, path: str, params: dict[str, Any] | None, data: Any) -> None:
+        """Store response in cache."""
+        key = self._cache_key(path, params)
+        print(f"CACHE SET: {key}")
+        _cache[key] = (time.time(), data)
+
     # -- core request ------------------------------------------------------ #
 
     def get_json(
@@ -209,6 +244,11 @@ class ElexonClient:
         :class:`ElexonApiError` on HTTP errors, malformed bodies or exhausted
         retries. Retries are bounded and the delay is injectable.
         """
+        # Check cache first (only for GET requests, which this is)
+        cached = self._get_cached(path, params)
+        if cached is not None:
+            return cached
+
         attempts = self.max_retries + 1
         last_error: ElexonApiError | None = None
 
@@ -227,13 +267,16 @@ class ElexonClient:
             else:
                 if response.status_code == 200:
                     try:
-                        return response.json()
+                        data = response.json()
                     except ValueError as exc:
                         raise ElexonApiError(
                             "Elexon returned a non-JSON body",
                             upstream_status=200,
                             detail=str(exc),
                         ) from exc
+                    # Cache successful responses
+                    self._set_cached(path, params, data)
+                    return data
 
                 detail = _problem_detail(response)
                 error = ElexonApiError(
@@ -292,3 +335,8 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
         return max(0.0, float(value))
     except ValueError:
         return None
+
+
+def clear_cache() -> None:
+    """Clear the upstream response cache (mainly for testing)."""
+    _cache.clear()

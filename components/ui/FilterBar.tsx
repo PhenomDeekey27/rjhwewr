@@ -9,12 +9,14 @@ export function FilterBar({
   onReset,
   resetDisabled = false,
   label = "Filters",
+  actions,
 }: {
   children: React.ReactNode;
   summary?: React.ReactNode;
   onReset?: () => void;
   resetDisabled?: boolean;
   label?: string;
+  actions?: React.ReactNode;
 }) {
   const [open, setOpen] = useState(false);
   const panelId = useId();
@@ -39,6 +41,7 @@ export function FilterBar({
         ) : null}
 
         <div className="ml-auto flex items-center gap-2">
+          {actions}
           {onReset ? (
             <button
               type="button"

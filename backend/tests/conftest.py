@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 
 import main
 from routes.elexon import get_elexon_client
-from services.elexon_client import ElexonClient
+from services.elexon_client import ElexonClient, clear_cache
 
 #: Path prefix of the real base URL; stripped so routes can be keyed by
 #: "/datasets/WINDFOR" and so tests never touch the network.
@@ -132,6 +132,14 @@ def fuelhh_row(
         "generation": generation,
     }
     return {k: v for k, v in row.items() if k not in omit}
+
+
+@pytest.fixture(autouse=True)
+def _clear_elexon_cache():
+    """Clear the Elexon client cache before each test."""
+    clear_cache()
+    yield
+    clear_cache()
 
 
 def make_client(routes: dict[str, Any] | None = None) -> tuple[ElexonClient, MockElexon]:

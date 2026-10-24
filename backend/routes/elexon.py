@@ -24,6 +24,7 @@ Nothing here writes data, and no credentials are involved.
 from __future__ import annotations
 
 from typing import Annotated, Iterator
+import math
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse

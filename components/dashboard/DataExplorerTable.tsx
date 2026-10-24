@@ -10,7 +10,8 @@ export type MatchStatus =
   | "Matched"
   | "No eligible forecast"
   | "No actual"
-  | "Invalid";
+  | "Invalid"
+  | "Source data only";
 
 export interface DataExplorerRow {
   deliveryTime: string;
@@ -65,7 +66,7 @@ const matchChip: Record<MatchStatus, { variant: StatusVariant; label: string }> 
   Matched: { variant: "favorable", label: "Matched" },
   "No eligible forecast": { variant: "warning", label: "No eligible forecast" },
   "No actual": { variant: "warning", label: "No actual" },
-  Invalid: { variant: "error", label: "Invalid" },
+  Invalid: { variant: "error", label: "Invalid" },"Source data only": { variant: "warning", label: "Source data only" },
 };
 
 function compare(
@@ -139,13 +140,22 @@ export function DataExplorerTable({
   onClearFilters,
   filtersActive = false,
   timeZoneLabel = "Europe/London",
+  pagination,
 }: {
   rows?: DataExplorerRow[];
   state?: "loading" | "empty" | "error" | "ready";
   onRowClick?: (row: DataExplorerRow) => void;
   onClearFilters?: () => void;
-  filtersActive?: boolean;
-  timeZoneLabel?: string;
+  filtersActive?: boolean;  timeZoneLabel?: string;
+  pagination?:
+    | {
+        page: number;
+        perPage: number;
+        totalRecords: number;
+        totalPages: number;
+      };
+  onPageChange?: (newPage: number) => void;
+  onPerPageChange?: (newPerPage: number) => void;
 }) {
   const [sortKey, setSortKey] = useState<SortKey>("deliveryTime");
   const [sortDirection, setSortDirection] = useState<"asc" | "desc">("asc");
@@ -155,6 +165,11 @@ export function DataExplorerTable({
       [...rows].sort((a, b) => compare(a, b, sortKey, sortDirection)),
     [rows, sortKey, sortDirection],
   );
+  const page = pagination?.page ?? 1;
+  const perPage = pagination?.perPage ?? 50;
+  const start = (page - 1) * perPage;
+  const end = start + perPage;
+  const pagedRows = sortedRows.slice(start, end);
 
   const toggleSort = (key: SortKey) => {
     if (key === sortKey) {
