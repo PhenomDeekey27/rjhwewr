@@ -1,7 +1,9 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  /* Keep the product UI clean in development. Compile and runtime errors are
+     still surfaced by Next.js. */
+  devIndicators: false,
   experimental: {
     agentFeedback: true,
   },

@@ -1,36 +1,55 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Wind Forecast Accuracy Dashboard
 
-## Getting Started
+Dashboard for a UK energy utility comparing Elexon WINDFOR wind forecasts against FUELHH actual wind generation, filtered to national (GB) data for January 2026 purchase decisions.
 
-First, run the development server:
+## Stack
+
+- Frontend: Next.js 16, React 19, Tailwind CSS, App Router, TypeScript
+- Backend: Python FastAPI
+
+## Prerequisites
+
+- Node.js 20+ and npm
+- Python 3.13+
+
+## Environment setup
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+cp .env.example .env
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+`.env` is gitignored — never commit it. Edit `.env` only if your backend runs on a different port.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Frontend (http://localhost:3000)
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+npm run dev      # development server with Turbopack
+npm run build    # production build
+npm run start    # production server
+npm run lint     # ESLint
+```
 
-## Learn More
+## Backend (http://localhost:8000)
 
-To learn more about Next.js, take a look at the following resources:
+```bash
+cd backend
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+# Windows (PowerShell)
+.venv\Scripts\Activate.ps1
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+# macOS / Linux
+# source .venv/bin/activate
 
-## Deploy on Vercel
+pip install -r requirements.txt
+uvicorn main:app --reload
+```
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Project stages
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+1. **Stage 1 (current):** Project foundation — `GET /api/health`, CORS for `http://localhost:3000`, frontend connection/status indicator with loading, success, and error states, `requirements.txt`, `.env.example`, README. No mock data.
+2. Stage 2: Backend fetching of Elexon WINDFOR forecasts and FUELHH actual generation (national wind data, January 2026).
+3. Stage 3: Forecast accuracy calculations.
+4. Stage 4: Charts and dashboard UI.
+5. Stage 5: Deployment.
+
+Real Elexon data is used throughout; mock data is not used for results.
