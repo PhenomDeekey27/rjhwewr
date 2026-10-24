@@ -1,0 +1,1 @@
+"""Backend test suite (Stage 3): mocked-HTTP tests for the Elexon integration."""

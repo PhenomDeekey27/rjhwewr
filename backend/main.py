@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from routes.elexon import router as elexon_router
 from routes.health import router as health_router
 
 load_dotenv()
@@ -25,6 +26,7 @@ app.add_middleware(
 )
 
 app.include_router(health_router, prefix="/api")
+app.include_router(elexon_router, prefix="/api")
 
 
 @app.get("/")
