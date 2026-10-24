@@ -1,48 +1,101 @@
 # Wind Forecast Accuracy Dashboard
 
-Dashboard for a UK energy utility comparing Elexon WINDFOR wind forecasts against FUELHH actual wind generation, filtered to national (GB) data for January 2026 purchase decisions.
+A full-stack dashboard for comparing Great Britain (GB) wind generation forecasts from Elexon WINDFOR with actual wind generation reported through FUELHH for **January 2026**.
 
-**This project was built with AI assistance (Freebuff/Codebuff). All code has been reviewed, tested, and verified.**
+The dashboard provides an overview of forecast accuracy, daily analysis, a paginated raw-data explorer, and a methodology page describing the assumptions behind the calculations.
 
-## Stack
+**Live app:** https://rjhwewr.vercel.app/  
+**Backend API:** https://wind-forecast-accuracy-api.onrender.com  
+**API health check:** https://wind-forecast-accuracy-api.onrender.com/api/health
 
-- Frontend: Next.js 16, React 19, Tailwind CSS, App Router, TypeScript
-- Backend: Python FastAPI
-- Data: Elexon Insights API (public, no API key required)
+> The frontend and backend are deployed separately. If the dashboard reports that the API is unavailable, check the production environment variables and CORS configuration described below.
 
-## Architecture
+## Features
 
-The application is separated into frontend and backend:
+- Overview of January 2026 forecast accuracy.
+- Forecast analysis with MAE, RMSE, bias, and matched coverage.
+- Paginated data explorer for WINDFOR forecast records and FUELHH actuals.
+- Data-quality metadata and explicit handling of missing intervals.
+- Methodology and assumptions documented in the application.
+- FastAPI backend with read-only API endpoints.
+- Docker support for running the backend.
 
-- **Frontend** (port 3000): Next.js app router, reads from `NEXT_PUBLIC_API_BASE_URL`
-- **Backend** (port 8000): FastAPI with CORS, reads Elexon Insight API data, serves read-only endpoints
+## Tech stack
 
-The frontend and backend can be deployed independently. The frontend API URL is controlled by the `NEXT_PUBLIC_API_BASE_URL` environment variable.
+- **Frontend:** Next.js 16, React 19, TypeScript, Tailwind CSS
+- **Backend:** Python, FastAPI, Uvicorn
+- **Data source:** Elexon Insights API
+- **Testing:** Vitest, pytest
+- **Deployment:** Vercel (frontend), Render (backend), Docker (backend container)
 
-## Prerequisites
+## Data and methodology
 
-- Node.js 20+ and npm
-- Python 3.13+
-- Git (for repository access)
+The application uses national GB data for January 2026:
 
-## Environment Setup
+- **WINDFOR:** wind generation forecasts.
+- **FUELHH:** actual wind generation outturn, filtered to `fuelType = WIND`.
+
+### Forecast selection
+
+For each January 2026 delivery interval, the application selects the latest WINDFOR publication with a `publishTime` at or before **D-1 09:00 Europe/London**. This cutoff is a proposed business assumption, not a confirmed market rule. The dashboard identifies it as an assumption.
+
+### Time alignment
+
+WINDFOR records are hourly in this dataset, while FUELHH records are half-hourly. Each hourly forecast is compared with the time-weighted mean of the two half-hourly actuals covering that hour. An interval is matched only when all required actual values are present and non-null. Missing values are not interpolated or silently filled.
+
+### Metrics
+
+For each matched interval, error is defined as:
+
+`e = forecast − actual`
+
+- **MAE:** mean absolute error.
+- **RMSE:** root mean squared error.
+- **Bias:** mean signed error; positive values indicate over-forecasting.
+- **Matched coverage:** matched intervals divided by expected intervals.
+
+Generation is reported in **MW**. These metrics describe forecast error; they do not directly quantify financial impact.
+
+The January 2026 snapshot recorded in the project documentation contains 744 matched hourly intervals, with MAE of approximately 2,142 MW, RMSE of approximately 2,612 MW, bias of approximately +1,852 MW, and 100% matched coverage. Results may change if the upstream data or selection assumptions change.
+
+## Project structure
+
+```text
+.
+├── app/                 # Next.js frontend
+├── backend/             # FastAPI backend
+│   ├── Dockerfile
+│   ├── .dockerignore
+│   ├── main.py
+│   └── requirements.txt
+├── .env.example
+├── package.json
+└── README.md
+```
+
+## Requirements
+
+- Node.js 20 or later and npm
+- Python 3.13 or a compatible version supported by `backend/requirements.txt`
+- Docker Desktop (optional, for containerized backend use)
+
+## Local development
+
+### 1. Configure environment variables
+
+Create a local `.env` file from the example:
 
 ```bash
-# Copy example environment file and edit as needed
 cp .env.example .env
 ```
 
-`.env` is gitignored — never commit it. The `.env.example` shows all required variables with safe defaults for local development.
+On Windows, you can copy the file in File Explorer or run:
 
-### Required Environment Variables
+```powershell
+Copy-Item .env.example .env
+```
 
-| Variable | Default | Description |
-|---|---|---|
-| `NEXT_PUBLIC_API_BASE_URL` | `http://localhost:8000` | Base URL for the backend API. **Must be changed to the production backend URL** before deploying the frontend. Use a relative path or production hostname; do not leave as `localhost`. |
-| `BACKEND_PORT` | `8000` | Port the FastAPI backend listens on. Change only if changing the default port. |
-| `CORS_ORIGINS` | `http://localhost:3000` | Comma-separated list of origins allowed to call the backend. **Must include the production frontend domain** when deploying. |
-
-### Local Development (.env)
+Use these values for local development:
 
 ```env
 NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
@@ -50,92 +103,104 @@ BACKEND_PORT=8000
 CORS_ORIGINS=http://localhost:3000
 ```
 
-### Production Setup
+Keep `.env` local and do not commit secrets. The Elexon Insights API used by this project is public and does not require an API key.
+
+### 2. Start the backend
+
+In a terminal:
+
+```powershell
+cd backend
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+For macOS/Linux, activate the environment with:
+
+```bash
+source .venv/bin/activate
+```
+
+The backend health endpoint should respond at http://localhost:8000/api/health.
+
+### 3. Start the frontend
+
+In a second terminal, from the repository root:
+
+```bash
+npm install
+npm run dev
+```
+
+Open http://localhost:3000.
+
+## API endpoints
+
+The backend exposes read-only endpoints:
+
+| Method and route | Purpose |
+|---|---|
+| `GET /api/health` | Health check |
+| `GET /api/elexon/windfor` | WINDFOR forecast records |
+| `GET /api/elexon/fuelhh` | FUELHH actual wind generation |
+| `GET /api/elexon/january-2026` | Dataset metadata and quality summary |
+| `GET /api/elexon/explorer` | Paginated joined raw records |
+| `GET /api/elexon/forecast-accuracy` | Forecast selection, alignment, and accuracy metrics |
+
+The explorer supports pagination and filtering through query parameters such as `page`, `perPage`, `sort`, `direction`, `status`, and `matchedOnly`. The backend returns data with metadata and data-quality information. Upstream failures are reported as API errors rather than replaced with fabricated results.
+
+## Run with Docker
+
+The backend includes a Dockerfile.
+
+From the repository root:
+
+```bash
+docker build -t wind-forecast-accuracy-backend ./backend
+docker run --rm -p 8000:8000 -e PORT=8000 wind-forecast-accuracy-backend
+```
+
+Then verify the container:
+
+```bash
+curl http://localhost:8000/api/health
+```
+
+Expected response:
+
+```json
+{"status":"ok"}
+```
+
+## Deployment configuration
+
+The frontend is deployed on Vercel and the backend on Render.
+
+### Vercel frontend
+
+Set this environment variable in the Vercel project settings, then redeploy the frontend:
 
 ```env
-NEXT_PUBLIC_API_BASE_URL=https://your-backend-domain.com
-BACKEND_PORT=8000
-CORS_ORIGINS=https://your-frontend-domain.com
+NEXT_PUBLIC_API_BASE_URL=https://wind-forecast-accuracy-api.onrender.com
 ```
 
-> **Important:** Do not use `http://localhost` or `http://127.0.0.1` in production. The `NEXT_PUBLIC_API_BASE_URL` must point to the actual backend hostname or IP. CORS will reject requests from unknown origins when `allow_credentials=True`.
+### Render backend
 
-## Frontend (port 3000)
+Set `CORS_ORIGINS` to the exact production frontend origin, for example:
 
-```bash
-npm run dev      # development server with Turbopack
-npm run build    # production build
-npm run start    # production server
-npm run lint     # ESLint
-npm test         # Vitest
+```env
+CORS_ORIGINS=https://rjhwewr.vercel.app
 ```
 
-## Backend (port 8000)
+If you use a different Vercel production domain or custom domain, use that origin instead. Preserve any other required origins as comma-separated values. Render supplies the runtime `PORT`; the backend must listen on `0.0.0.0` and that port in production.
 
-```bash
-cd backend
+Do not set the frontend API URL to `localhost` in production. `localhost` refers to the visitor's own device, not the deployed backend.
 
-# Windows (PowerShell)
-.venv\Scripts\Activate.ps1
+## Tests and quality checks
 
-# macOS / Linux
-source .venv/bin/activate
-
-pip install -r requirements.txt
-pip install -r requirements-dev.txt  # for tests
-
-# Start with production-friendly settings
-uvicorn main:app --host 127.0.0.1 --port 8000 --log-level warning
-```
-
-## Backend API
-
-All endpoints are read-only and return `{"data", "meta", "quality"}`.
-
-- `GET /api/health` — backend health check. Returns `{"status":"ok"}`.
-- `GET /api/elexon/windfor` — raw WINDFOR forecast records for January 2026 delivery intervals.
-- `GET /api/elexon/fuelhh` — raw FUELHH outturn records filtered to `fuelType = WIND`.
-- `GET /api/elexon/january-2026` — compact metadata/quality summary for both datasets.
-- `GET /api/elexon/explorer` — one server-paginated page of joined raw interval records. Query parameters: `page`, `perPage` (1–500), `sort`, `direction`, `status`, `matchedOnly`.
-- `GET /api/elexon/forecast-accuracy` — day-ahead forecast selection, resolution alignment and MAE/RMSE/bias/coverage.
-
-Every endpoint accepts `?refresh=true`, which bypasses both the prepared-result cache and the upstream HTTP cache and rebuilds from Elexon. Upstream failures return HTTP 502 or 504 with the same envelope shape and `meta.error`.
-
-### Data Explorer Performance
-
-The raw joined set is 18,848 rows (18,104 WINDFOR publication versions plus 744 FUELHH-only half-hours). It is never sent to the browser in full:
-
-- The backend builds and validates the prepared rows once, keeps them in an in-process cache (default TTL 600 s), and slices the requested page after filtering and sorting.
-- The client requests exactly one page and cancels the previous request when the user changes page, filter, sort or page size.
-- Loading, empty, stale and error states are explicit.
-- A 50-row explorer page is 20,811 bytes (99.1% less than the full dataset).
-
-## Forecast Methodology
-
-All metrics are computed in the backend from the same prepared snapshot the pages display.
-
-1. **Selection.** For every January 2026 delivery interval, keep the WINDFOR forecast with the latest `publishTime` at or before **D‑1 09:00 Europe/London**. The cutoff is a proposed business assumption, not a confirmed rule; it is held in one place, labelled in the UI and listed in the methodology page's assumptions register. A later forecast is never used and missing intervals are never back-filled.
-
-2. **Alignment.** WINDFOR is hourly and FUELHH is half-hourly in this window (both resolutions are detected from the data, not assumed). Each hourly forecast interval `[t, t + 60 min)` is compared with the time-weighted mean of the two FUELHH half-hours that exactly cover it. An interval is matched only when every required actual is present and non-null. There is no interpolation, no duplication of a forecast into finer slots and no partial-interval mean; excluded intervals are counted by reason.
-
-3. **Metrics.** Over matched intervals, with `e = F − A`: `MAE = (1/n) Σ|e|`, `RMSE = √((1/n) Σe²)`, `bias = (1/n) Σe` (positive = over-forecast) and `coverage = n_matched / n_expected`. Metrics are `None` (shown as "—") when `n = 0`; zero is never used as a stand-in for missing data.
-
-4. **Units.** Both `generation` fields are power in **MW**, not energy in MWh. Elexon labels the peak wind forecast in MW, and FUELHH values are average MW over each settlement period. Units were verified on 24 October 2026 against Elexon's Insights API dataset documentation and the BMRA & SAA Interface Specification.
-
-The current January 2026 snapshot has 744 hourly intervals, all 744 matched (1,488 of 1,488 half-hours): MAE 2,142 MW, RMSE 2,612 MW, bias +1,852 MW (over-forecast) and 100% coverage.
-
-## Automated Tests
-
-Backend:
-
-```bash
-cd backend
-.venv\Scripts\python -m pytest -q
-```
-
-73 tests pass. External Elexon requests are mocked with `httpx.MockTransport`; no test requires network access.
-
-Frontend:
+Run frontend checks from the repository root:
 
 ```bash
 npm test
@@ -144,137 +209,26 @@ npx tsc --noEmit
 npm run build
 ```
 
-32 Vitest tests pass (API query construction/caching and the paginated explorer table), and lint, typecheck and the production build pass.
-
-## Live Elexon Smoke Test
+Run backend tests:
 
 ```bash
 cd backend
-.venv\Scripts\python live_smoke_elexon.py
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
 ```
 
-Results from a run on 2026-10-24:
-- WINDFOR: 18,104 accepted records out of 28,616 fetched rows; 10,512 rows excluded as outside the January 2026 delivery window; 0 null generation values.
-- FUELHH: 1,488 accepted records out of 1,488 fetched rows; 0 rejected rows; 0 null generation values.
+The project documentation records 32 frontend tests and 73 backend tests passing at the time of the last verification. Run the commands above against the current checkout to confirm its state.
 
-## Remaining Assumptions and Limitations
+## Assumptions and limitations
 
-- The D‑1 09:00 Europe/London cutoff is unconfirmed. Changing it changes which forecast is selected for every interval and therefore every metric.
-- Accuracy thresholds are not agreed, so KPIs use a neutral status rather than pass/fail colouring.
-- Results describe January 2026 national wind only. The national aggregate hides regional variation, MW metrics are not normalised by installed capacity, and error metrics do not capture financial impact.
-- FUELHH is outturn-based; the dashboard reports the snapshot retrieved at load time and does not track later revisions.
-- CSV export is disabled because the table is server-paginated; exporting only the visible page would misrepresent the dataset.
+- The D-1 09:00 Europe/London forecast publication cutoff is an unconfirmed business assumption.
+- The analysis covers national GB wind generation for January 2026 only; it does not show regional differences.
+- MAE, RMSE, and bias are expressed in MW and are not normalized by installed capacity.
+- Forecast error metrics do not directly measure financial impact.
+- FUELHH outturn data represents the retrieved snapshot and may be revised upstream.
+- Accuracy thresholds have not been agreed, so the dashboard avoids pass/fail KPI status labels.
+- CSV export is not provided; exporting only the currently visible page would misrepresent the full paginated dataset.
 
-## Project Stages
+## AI assistance
 
-1. Stage 1: Project foundation — health endpoint, CORS, frontend connection state, `requirements.txt`, `.env.example`, README.
-2. Stage 2: Backend fetching of Elexon WINDFOR and FUELHH data, pagination, validation, quality metadata and observed-resolution detection.
-3. Stage 3: Forecast selection, resolution alignment and accuracy metrics, with automated tests.
-4. Stage 4 (current): Dashboard UI — server-paginated Data Explorer, Forecast Analysis (daily results, charts, missing-data reporting), Overview summary and the methodology page.
-5. Stage 5: Deployment (not started).
-
-Real Elexon data is used throughout; mock data is not used for results.
-
-## Deployment Checklist
-
-Before deploying, configure the following:
-
-- [ ] Set `NEXT_PUBLIC_API_BASE_URL` to the production backend URL (e.g., `https://api.yourdomain.com`)
-- [ ] Set `CORS_ORIGINS` to include the production frontend domain (e.g., `https://frontend.yourdomain.com`)
-- [ ] Verify the backend serves HTTPS with a valid certificate if the frontend is hosted separately
-- [ ] Run `npm run build` and verify success
-- [ ] Run `cd backend && .venv/Scripts/python -m pytest -q` and verify 73 tests pass
-- [ ] Verify health endpoint: `GET /api/health` returns `{"status":"ok"}`
-- [ ] Test API routes with `curl` or browser: windfor, fuelhh, january-2026, explorer, forecast-accuracy
-- [ ] Confirm no secrets or API keys are committed (the Elexon Insights API is public, no credentials needed)
-- [ ] Update DNS/hosting to point to the deployed frontend and backend
-
-## Verified Commands
-
-```bash
-# From project root
-npm run build           # production build — verified passing
-npm run lint            # ESLint — verified passing
-npx tsc --noEmit       # TypeScript check — verified passing
-npm test               # vitest — verified passing (32 tests)
-cd backend && ./.venv/Scripts/python -m pytest -q  # backend — verified passing (73 tests)
-```
-
-## Docker Support
-
-This project now includes Docker support for the backend FastAPI service.
-
-### Backend Docker
-
-```bash
-# Build the backend image
-cd backend
-docker build -t wind-forecast-accuracy-backend .
-
-# Run the backend container
-# -p 8000:8000 maps the container's FastAPI port to host port 8000
-# -e PORT=8000 sets the FastAPI port (defaults to 8000 if omitted)
-docker run -d -p 8000:8000 -e PORT=8000 wind-forecast-accuracy-backend
-
-# Health check
-# Verify the /api/health endpoint inside the container:
-curl http://localhost:8000/api/health
-# Expected: {"status":"ok"}
-
-# Alternatively, use Docker's health check:
-docker inspect --format='{{.State.Health.Status}}' wind-forecast-accuracy-backend
-```
-
-### Full-Stack Development with Docker Compose
-
-A docker-compose.yml is not provided, but you can create one:
-
-```yaml
-version: '3.8'
-services:
-  backend:
-    build:
-      context: ./backend
-    ports:
-      - "8000:8000"
-    environment:
-      - PORT=8000
-    volumes:
-      - ./backend:/app
-  frontend:
-    build:
-      context: .
-    ports:
-      - "3000:3000"
-    environment:
-      - NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
-    depends_on:
-      backend:
-        condition: service_healthy
-```
-
-### Health Check URLs
-
-- Backend container: `http://localhost:8000/api/health` (expected: `{"status":"ok"}`)
-- Frontend container: `http://localhost:3000` (navigate to the app)
-```
-
-## Browser Checks (Perform After Deployment)
-
-| Check | Status |
-|---|---|
-| Navigation between all routes (/overview, /data-explorer, /forecast-analysis, /methodology, /_not-found) | ✅ Verified in development |
-| Responsive layouts (desktop 1440×1000, tablet 768×1024, mobile 390×844/320) | ✅ Verified in development |
-| Console errors on page load | ✅ Verified in development (none) |
-| API failure recovery (simulate backend down) | ✅ Verified in development (error states render correctly) |
-| Keyboard navigation (Tab focus, focus-visible styles) | ⚠️ Manual verification required |
-| Screen reader compatibility | ⚠️ Manual verification required |
-| CORS headers on API responses | ⚠️ Manual verification required in production |
-| Environment variable configuration | ⚠️ Manual verification required |
-
-## API Health Check URLs
-
-- Local: `http://localhost:8000/api/health`
-- Production: `https://your-backend-domain.com/api/health`
-
-Expected response: `{"status":"ok"}`
+AI tools (Freebuff/Codebuff) were used during development. The implementation, tests, and outputs were reviewed as part of the development process.
